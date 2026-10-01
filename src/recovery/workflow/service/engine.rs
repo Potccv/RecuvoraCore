@@ -1,560 +1,476 @@
+//! Deterministic workflow. All I/O, clocks, scheduling and commit CAS belong to Host.
 use super::contract::{evidence, facts};
-use super::storage::TaskStore;
 use super::*;
-use approval::{ApprovalState, ApprovalStore, ApprovalStoreConfig, ExecutionOutcome, ReviewStage};
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::operation::{CommitRequest, Prepared};
+use approval::{ApprovalRecord, ApprovalState, ExecutionPermit};
 
-fn cached_script_denial_context(record: &approval::ApprovalRecord) -> Option<String> {
-    let assessment = record.assessment.as_ref()?;
-    if record.state != ApprovalState::Denied
-        || assessment.decision != approval::ApprovalDecision::Deny
-        || !matches!(
-            assessment.reviewer,
-            approval::AssessmentSource::Harness { .. }
-        )
-    {
-        return None;
-    }
-    Some(
-        serde_json::json!({
-            "kind": "cached_script_rejected",
-            "request_id": record.request.request_id,
-            "assessment": assessment,
-            "next_step": "diagnose an alternative within the original delegated scope"
-        })
-        .to_string(),
-    )
+/// Host must hold this logical ownership epoch through commit and dispatch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetAuthority {
+    pub target_id: String,
+    pub epoch: String,
 }
 
-struct State {
-    tasks: TaskStore,
-    approvals: ApprovalStore,
-    knowledge: KnowledgeStore,
+/// Current trusted incident fact. Host must check its revision atomically with
+/// execution authorization, or hold its incident gate through that commit.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncidentEvidence {
+    pub incident_id: String,
+    pub revision: u64,
+    pub active: bool,
 }
 
-struct BoundKnowledgeSource {
-    identity: String,
-    source: Arc<dyn KnowledgeSource>,
+/// Stable, independently retryable experience delivery. Persist with task result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeDelivery {
+    pub id: String,
+    pub created_revision: u64,
+    pub candidate: KnowledgeCandidate,
+    pub case: RepairCase,
+    pub verification: Option<BusinessVerificationRecord>,
+    pub delivered: bool,
 }
 
-/// Complete a durable approval intent using the original operation identity.
-/// A repeated request preserves the authority's decision, deadline and permit state.
-fn attach_approval(
-    tasks: &mut TaskStore,
-    approvals: &mut ApprovalStore,
-    config: &RecoveryConfig,
-    mut task: RecoveryTask,
-    now_ms: u64,
-) -> Result<RecoveryTask, RecoveryError> {
-    let operation = task
-        .operation
-        .clone()
-        .ok_or_else(|| service("missing durable approval intent"))?;
-    let policy = if task.reused_script {
-        &config.script_approval
-    } else {
-        &config.approval
-    };
-    let record = approvals.request(operation, policy.clone(), now_ms / 1000)?;
-    task.approval_id = Some(record.request.request_id);
-    tasks.save(task, config, now_ms)
+/// Data Host persists. Loading it never dispatches an external operation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecoveryEvent {
+    Register {
+        problem: ProblemContext,
+        incident: IncidentEvidence,
+    },
+    SelectPlan {
+        task_id: String,
+        revision: u64,
+        observation: TargetObservation,
+        candidate: Option<KnowledgeRecord>,
+    },
+    RetryDiagnosis {
+        task_id: String,
+        revision: u64,
+        observation: TargetObservation,
+    },
+    DiagnosisCompleted {
+        task_id: String,
+        revision: u64,
+        call_id: String,
+        plan: RepairPlan,
+    },
+    DiagnosisFailed {
+        task_id: String,
+        revision: u64,
+        call_id: String,
+        reason: String,
+    },
+    ApprovalAttached {
+        task_id: String,
+        revision: u64,
+        record: ApprovalRecord,
+    },
+    ApprovalResolved {
+        task_id: String,
+        revision: u64,
+        record: ApprovalRecord,
+    },
+    /// Only replay accepts this directly; live preparation requires an owned permit.
+    ExecutionAuthorized {
+        task_id: String,
+        revision: u64,
+        approval: ApprovalRecord,
+        observation: TargetObservation,
+        incident: IncidentEvidence,
+        authority: TargetAuthority,
+    },
+    ExecutionRecorded {
+        task_id: String,
+        revision: u64,
+        receipt: ScriptReceipt,
+        approval: ApprovalRecord,
+    },
+    VerificationRecorded {
+        task_id: String,
+        revision: u64,
+        verification: BusinessVerification,
+    },
+    VerificationUnavailable {
+        task_id: String,
+        revision: u64,
+        reason: String,
+    },
+    ResultChecked {
+        task_id: String,
+        revision: u64,
+        execution: ExecutionResultCheck,
+        verification: BusinessVerification,
+        actor: String,
+        approval: ApprovalRecord,
+    },
+    Resume {
+        task_id: String,
+        revision: u64,
+    },
+    Cancel {
+        task_id: String,
+        revision: u64,
+        approval: Option<ApprovalRecord>,
+    },
+    Recover,
+    DeliveryConfirmed {
+        delivery_id: String,
+    },
 }
 
-/// One configured target, with durable tasks and one authority for its approvals.
-/// Applications authenticate callers of management methods and protect runtime files.
-pub struct RecoveryService {
+pub enum RecoveryCommand {
+    Event(RecoveryEvent),
+    AuthorizeExecution {
+        task_id: String,
+        revision: u64,
+        permit: ExecutionPermit,
+        approval: ApprovalRecord,
+        observation: TargetObservation,
+        incident: IncidentEvidence,
+        authority: TargetAuthority,
+    },
+}
+
+/// Effects are available only after confirming the whole workflow commit.
+#[derive(Debug)]
+pub enum RecoveryEffect {
+    Diagnose {
+        task: Box<RecoveryTask>,
+        call_id: String,
+        timeout_secs: u64,
+        max_tool_calls: usize,
+    },
+    RequestApproval {
+        operation: approval::ProposedOperation,
+        policy: approval::ApprovalPolicy,
+    },
+    Execute {
+        permit: ExecutionPermit,
+        authority: TargetAuthority,
+        timeout_secs: u64,
+    },
+    Verify {
+        task_id: String,
+        operation: approval::ProposedOperation,
+        receipt: ScriptReceipt,
+    },
+    DeliverKnowledge(Box<KnowledgeDelivery>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryEntry {
+    pub request: CommitRequest,
+    pub now_ms: u64,
+    pub event: RecoveryEvent,
+}
+
+/// Authority reconstructed through the same validated transitions used live.
+/// No unchecked Deserialize implementation and no ambient clock or I/O.
+#[derive(Clone, Debug)]
+pub struct RecoveryState {
     config: RecoveryConfig,
-    backend: Arc<dyn RepairBackend>,
-    clock: Arc<dyn RecoveryClock>,
-    state: Mutex<Option<State>>,
-    active: Mutex<BTreeSet<String>>,
-    calls: CallScope,
-    accepting: AtomicBool,
-    incident_guard: OnceLock<Arc<dyn IncidentGuard>>,
-    state_directory: PathBuf,
-    ownership: Mutex<Option<Box<dyn TargetLease>>>,
-    knowledge_source: OnceLock<BoundKnowledgeSource>,
+    revision: u64,
+    updated_at_ms: u64,
+    tasks: BTreeMap<String, RecoveryTask>,
+    deliveries: BTreeMap<String, KnowledgeDelivery>,
+    quarantined: BTreeSet<(String, u64)>,
+    scripts: BTreeMap<(String, u64), ScriptArtifact>,
+    candidates: BTreeMap<String, KnowledgeCandidate>,
+    entries: Vec<RecoveryEntry>,
+    recovery_required: bool,
 }
 
-impl RecoveryService {
-    pub fn open(
-        dir: impl AsRef<Path>,
-        config: RecoveryConfig,
-        backend: Arc<dyn RepairBackend>,
-    ) -> Result<Arc<Self>, RecoveryError> {
-        Self::open_with_store_configs(
-            dir,
-            config,
-            backend,
-            ApprovalStoreConfig::default(),
-            KnowledgeStoreConfig::default(),
-        )
-    }
-    pub fn open_with_store_configs(
-        dir: impl AsRef<Path>,
-        config: RecoveryConfig,
-        backend: Arc<dyn RepairBackend>,
-        approval_store_config: ApprovalStoreConfig,
-        knowledge_store_config: KnowledgeStoreConfig,
-    ) -> Result<Arc<Self>, RecoveryError> {
-        Self::open_with_clock_and_store_configs(
-            dir,
-            config,
-            backend,
-            Arc::new(SystemRecoveryClock),
-            approval_store_config,
-            knowledge_store_config,
-        )
-    }
-    pub fn open_with_clock(
-        dir: impl AsRef<Path>,
-        config: RecoveryConfig,
-        backend: Arc<dyn RepairBackend>,
-        clock: Arc<dyn RecoveryClock>,
-    ) -> Result<Arc<Self>, RecoveryError> {
-        Self::open_with_clock_and_store_configs(
-            dir,
-            config,
-            backend,
-            clock,
-            ApprovalStoreConfig::default(),
-            KnowledgeStoreConfig::default(),
-        )
-    }
-    pub fn open_with_clock_and_store_configs(
-        dir: impl AsRef<Path>,
-        config: RecoveryConfig,
-        backend: Arc<dyn RepairBackend>,
-        clock: Arc<dyn RecoveryClock>,
-        approval_store_config: ApprovalStoreConfig,
-        knowledge_store_config: KnowledgeStoreConfig,
-    ) -> Result<Arc<Self>, RecoveryError> {
+impl RecoveryState {
+    pub fn new(config: RecoveryConfig) -> Result<Self, RecoveryError> {
         config.validate()?;
-        approval_store_config.validate()?;
-        knowledge_store_config.validate().map_err(service)?;
-        let dir = dir.as_ref();
-        let mut tasks = TaskStore::open(dir, &config)?;
-        let mut approvals = ApprovalStore::open(
-            dir.join("approvals"),
-            approval_store_config,
-            clock.now_ms() / 1000,
-        )?;
-        let knowledge = KnowledgeStore::open(dir.join("knowledge.jsonl"), knowledge_store_config)
-            .map_err(service)?;
-        let recovered: Vec<_> = tasks.tasks.values().cloned().collect();
-        for mut task in recovered {
-            if task.stage == RecoveryStage::AwaitingApproval && task.approval_id.is_none() {
-                task = attach_approval(&mut tasks, &mut approvals, &config, task, clock.now_ms())?;
-            }
-            let authority = task
-                .approval_id
-                .as_ref()
-                .and_then(|id| approvals.get(id))
-                .map(|r| r.state);
-            if task.stage == RecoveryStage::Executing || authority == Some(ApprovalState::Unknown) {
-                if authority == Some(ApprovalState::Approved) {
-                    task.stage = RecoveryStage::Paused;
-                    task.note =
-                        Some("execution intent was not consumed; explicit resume required".into());
-                } else {
-                    task.stage = RecoveryStage::Unknown;
-                    task.note = Some("interrupted execution; check target and executor results before continuing".into());
-                }
-                tasks.save(task, &config, clock.now_ms())?;
-            } else if task.stage == RecoveryStage::AwaitingApproval
-                && task
-                    .approval_id
-                    .as_ref()
-                    .and_then(|id| approvals.get(id))
-                    .is_some_and(|r| r.state == ApprovalState::Approved)
-            {
-                task.stage = RecoveryStage::Paused;
-                task.note = Some(
-                    "recovered approval; trusted explicit resume required before dispatch".into(),
-                );
-                tasks.save(task, &config, clock.now_ms())?;
-            }
-        }
-        Ok(Arc::new(Self {
+        Ok(Self {
             config,
-            backend,
-            clock,
-            state: Mutex::new(Some(State {
-                tasks,
-                approvals,
-                knowledge,
-            })),
-            active: Mutex::new(BTreeSet::new()),
-            calls: CallScope::default(),
-            accepting: AtomicBool::new(true),
-            incident_guard: OnceLock::new(),
-            state_directory: dir.to_path_buf(),
-            ownership: Mutex::new(None),
-            knowledge_source: OnceLock::new(),
-        }))
+            revision: 0,
+            updated_at_ms: 0,
+            tasks: BTreeMap::new(),
+            deliveries: BTreeMap::new(),
+            quarantined: BTreeSet::new(),
+            scripts: BTreeMap::new(),
+            candidates: BTreeMap::new(),
+            entries: Vec::new(),
+            recovery_required: false,
+        })
+    }
+    pub fn tasks(&self) -> impl Iterator<Item = &RecoveryTask> {
+        self.tasks.values()
+    }
+    pub fn recovery_required(&self) -> bool {
+        self.recovery_required
     }
     pub fn config(&self) -> &RecoveryConfig {
         &self.config
     }
-    /// Host must use one ownership authority for every alias of this target.
-    /// Opening a store alone enables recovery/querying, never dispatch.
-    pub fn bind_target_ownership(
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn entries(&self) -> &[RecoveryEntry] {
+        &self.entries
+    }
+    pub fn task(&self, id: &str) -> Option<&RecoveryTask> {
+        self.tasks.get(id)
+    }
+    pub fn pending_deliveries(&self) -> Vec<KnowledgeDelivery> {
+        let mut deliveries: Vec<_> = self
+            .deliveries
+            .values()
+            .filter(|d| !d.delivered)
+            .cloned()
+            .collect();
+        deliveries.sort_by_key(|delivery| (delivery.created_revision, delivery.id.clone()));
+        deliveries
+    }
+    pub fn is_quarantined(&self, id: &str, version: u64) -> bool {
+        self.quarantined.contains(&(id.into(), version))
+    }
+
+    /// Host persists the new entry and compares request.expected_revision, then
+    /// confirms. Commit failure/uncertainty grants no effect; reload before retry.
+    pub fn prepare(
         &self,
-        authority: Arc<dyn TargetOwnership>,
-    ) -> Result<(), RecoveryError> {
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(RecoveryError::Stopped);
-        }
-        let mut owner = lock(&self.ownership)?;
-        if owner.is_some() {
-            return Err(RecoveryError::Invalid(
-                "target ownership already bound".into(),
-            ));
-        }
-        let target = CanonicalTarget::new(self.config.target.target_id.clone())?;
-        let lease = authority.acquire(&target, &self.state_directory)?;
-        if lease.target() != &target
-            || lease.recovery_directory() != self.state_directory.canonicalize()?
+        commit_id: impl Into<String>,
+        command: RecoveryCommand,
+        now_ms: u64,
+        knowledge: &KnowledgeState,
+    ) -> Result<Prepared<Self, RecoveryEffect>, RecoveryError> {
+        if self.recovery_required
+            && !matches!(&command, RecoveryCommand::Event(RecoveryEvent::Recover))
         {
-            return Err(RecoveryError::Invalid(
-                "ownership target or store mismatch".into(),
+            return Err(invalid(
+                "restored workflow requires a committed recovery transition",
             ));
         }
-        lease.validate()?;
-        *owner = Some(lease);
-        Ok(())
-    }
-    fn check_ownership(&self) -> Result<(), RecoveryError> {
-        lock(&self.ownership)?
-            .as_ref()
-            .ok_or_else(|| service("canonical target ownership required"))?
-            .validate()
-    }
-    /// A source returns bounded proposals only; its claims cannot attest success.
-    pub fn bind_knowledge_source(
-        &self,
-        source: Arc<dyn KnowledgeSource>,
-    ) -> Result<(), RecoveryError> {
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(RecoveryError::Stopped);
-        }
-        let identity = source.identity();
-        if !crate::identity::valid_id(identity) {
-            return Err(RecoveryError::Invalid(
-                "invalid knowledge source identity".into(),
-            ));
-        }
-        let identity = identity.to_owned();
-        self.knowledge_source
-            .set(BoundKnowledgeSource { identity, source })
-            .map_err(|_| RecoveryError::Invalid("knowledge source already bound".into()))
-    }
-    /// Binds a trusted incident authority for this runtime, exactly once.
-    /// Reopened workflows must bind again; missing authority never allows execution.
-    pub fn bind_incident_guard(&self, guard: Arc<dyn IncidentGuard>) -> Result<(), RecoveryError> {
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(RecoveryError::Stopped);
-        }
-        self.incident_guard.set(guard).map_err(|_| {
-            RecoveryError::Invalid("incident guard is already bound for this runtime".into())
-        })
-    }
-    fn state<T>(
-        &self,
-        action: impl FnOnce(&mut State) -> Result<T, RecoveryError>,
-    ) -> Result<T, RecoveryError> {
-        let mut state = lock(&self.state)?;
-        action(state.as_mut().ok_or(RecoveryError::Stopped)?)
-    }
-    fn save(&self, task: RecoveryTask) -> Result<RecoveryTask, RecoveryError> {
-        self.state(|s| s.tasks.save(task, &self.config, self.clock.now_ms()))
-    }
-    fn task(&self, id: &str) -> Result<RecoveryTask, RecoveryError> {
-        self.query(id)?
-            .ok_or_else(|| RecoveryError::Invalid("task not found".into()))
-    }
-    fn claim(&self, id: &str) -> Result<Active<'_>, RecoveryError> {
-        if !lock(&self.active)?.insert(id.to_owned()) {
-            return Err(RecoveryError::Busy);
-        }
-        Ok(Active {
-            active: &self.active,
-            id: id.to_owned(),
-        })
-    }
-    pub fn query(&self, id: &str) -> Result<Option<RecoveryTask>, RecoveryError> {
-        self.state(|s| Ok(s.tasks.tasks.get(id).cloned()))
-    }
-    pub fn tasks(&self) -> Result<Vec<RecoveryTask>, RecoveryError> {
-        self.state(|s| Ok(s.tasks.tasks.values().cloned().collect()))
-    }
-    pub fn inspect_tasks(
-        &self,
-        query: &RecoveryQuery,
-    ) -> Result<Vec<RecoveryTaskSummary>, RecoveryError> {
-        query.validate()?;
-        self.state(|s| {
-            Ok(s.tasks
-                .tasks
-                .values()
-                .filter(|task| {
-                    (query.stages.is_empty() || query.stages.contains(&task.stage))
-                        && query.after_id.as_ref().is_none_or(|id| &task.id > id)
-                })
-                .take(query.limit)
-                .map(RecoveryTaskSummary::from)
-                .collect())
-        })
-    }
-    pub fn overview(&self) -> Result<RecoveryOverview, RecoveryError> {
-        self.state(|s| {
-            s.tasks.ensure_current()?;
-            let (journal_bytes, task_count, journal_limit_bytes, task_limit) = s.tasks.usage();
-            let mut stages = BTreeMap::new();
-            for task in s.tasks.tasks.values() {
-                *stages.entry(task.stage.clone()).or_insert(0) += 1;
-            }
-            Ok(RecoveryOverview {
-                task_count,
-                task_limit,
-                journal_bytes,
-                journal_limit_bytes,
-                stages,
-                unknown_approvals: s
-                    .approvals
-                    .list()
-                    .iter()
-                    .filter(|record| record.state == ApprovalState::Unknown)
-                    .count(),
-            })
-        })
-    }
-    pub fn knowledge(&self, query: &KnowledgeQuery) -> Result<Vec<KnowledgeRecord>, RecoveryError> {
-        self.state(|s| s.knowledge.search(query).map_err(service))
-    }
-    pub fn submit(&self, problem: ProblemContext) -> Result<RecoveryTask, RecoveryError> {
-        self.check_ownership()?;
-        problem.validate()?;
-        if problem.target_id != self.config.target.target_id {
-            return Err(RecoveryError::Invalid("target binding mismatch".into()));
-        }
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(RecoveryError::Stopped);
-        }
-        // Repeated delivery remains a read of the original durable episode,
-        // including after the incident has been resolved.
-        if let Some(old) = self.state(|s| {
-            Ok(s.tasks
-                .tasks
-                .values()
-                .find(|task| task.problem.incident_id == problem.incident_id)
-                .cloned())
-        })? {
-            if old.problem.target_id != problem.target_id
-                || old.problem.fingerprint != problem.fingerprint
-            {
-                return Err(RecoveryError::Invalid("incident identity changed".into()));
-            }
-            return Ok(old);
-        }
-        let guard = self
-            .incident_guard
-            .get()
-            .ok_or_else(|| service("incident authority required for episode registration"))?;
-        if !matches!(guard.check(&problem)?, IncidentReadiness::Active { revision }
-            if revision == problem.incident_revision)
-        {
-            return Err(RecoveryError::Invalid(
-                "current authoritative incident episode required".into(),
-            ));
-        }
-        self.state(|s| {
-            // Repeated notifications and changing incident revisions never create duplicate repairs.
-            if let Some(old) = s
-                .tasks
-                .tasks
-                .values()
-                .find(|t| t.problem.incident_id == problem.incident_id)
-            {
-                if old.problem.target_id != problem.target_id
-                    || old.problem.fingerprint != problem.fingerprint
-                {
-                    return Err(RecoveryError::Invalid("incident identity changed".into()));
+        let (event, permit) = match command {
+            RecoveryCommand::Event(event) => {
+                if matches!(event, RecoveryEvent::ExecutionAuthorized { .. }) {
+                    return Err(invalid("execution requires an owned committed permit"));
                 }
-                return Ok(old.clone());
+                (event, None)
             }
-            if s.tasks
-                .tasks
-                .values()
-                .any(|t| t.problem.target_id == problem.target_id && !t.stage.terminal())
-            {
-                return Err(RecoveryError::Busy);
-            }
-            let episodes = s
-                .tasks
-                .tasks
-                .values()
-                .filter(|t| {
-                    t.problem.target_id == problem.target_id
-                        && t.problem.fingerprint == problem.fingerprint
-                        && t.problem.conditions == problem.conditions
-                })
-                .count() as u64
-                + 1;
-            let now = self.clock.now_ms();
-            s.tasks.save(
-                RecoveryTask {
-                    id: crate::identity::call_id(),
-                    revision: 0,
-                    problem,
-                    episode_count: episodes,
-                    stage: RecoveryStage::Queued,
-                    diagnosis_attempts: 0,
-                    plan: None,
-                    knowledge_id: None,
-                    reused_script: false,
-                    approval_id: None,
-                    operation: None,
-                    observation: None,
-                    receipt: None,
-                    verification: None,
-                    result_check: None,
-                    note: None,
-                    created_at_ms: now,
-                    updated_at_ms: now,
-                },
-                &self.config,
-                now,
-            )
-        })
-    }
-    pub fn approval(
-        &self,
-        task_id: &str,
-    ) -> Result<Option<approval::ApprovalRecord>, RecoveryError> {
-        let task = self.task(task_id)?;
-        self.state(|s| {
-            Ok(task
-                .approval_id
-                .as_ref()
-                .and_then(|id| s.approvals.get(id))
-                .cloned())
-        })
-    }
-    /// Records a human decision only. It never dispatches the action itself.
-    pub fn decide_human(
-        &self,
-        task_id: &str,
-        revision: u64,
-        decision: approval::ApprovalDecision,
-        actor: String,
-        reason: String,
-    ) -> Result<approval::ApprovalRecord, RecoveryError> {
-        let task = self.task(task_id)?;
-        let id = task
-            .approval_id
-            .as_ref()
-            .ok_or_else(|| service("task has no approval"))?;
-        self.state(|s| {
-            Ok(s.approvals.decide_human_at_revision(
-                id,
+            RecoveryCommand::AuthorizeExecution {
+                task_id,
                 revision,
-                approval::ApprovalAssessment {
-                    decision,
-                    reason,
-                    reviewer: approval::AssessmentSource::Human { actor },
-                },
-                self.policy(&task),
-                self.clock.now_ms() / 1000,
-            )?)
-        })
-    }
-    pub fn resume(&self, task_id: &str, revision: u64) -> Result<RecoveryTask, RecoveryError> {
-        self.check_ownership()?;
-        let mut task = self.task(task_id)?;
-        if task.revision != revision || task.stage != RecoveryStage::Paused {
-            return Err(RecoveryError::Busy);
-        }
-        task.stage = RecoveryStage::AwaitingApproval;
-        self.save(task)
-    }
-    pub async fn advance(
-        self: &Arc<Self>,
-        id: &str,
-        cancellation: Cancellation,
-    ) -> Result<RecoveryTask, RecoveryError> {
-        self.check_ownership()?;
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(RecoveryError::Stopped);
-        }
-        let recovery = self.clone();
-        let id = id.to_owned();
-        self.calls
-            .run(cancellation.clone(), async move {
-                let _active = recovery.claim(&id)?;
-                recovery.drive(&id, cancellation).await
-            })
-            .await
-            .map_err(service)?
-    }
-    pub async fn shutdown(&self) -> Result<(), RecoveryError> {
-        self.accepting.store(false, Ordering::Release);
-        self.calls.shutdown().await.map_err(service)?;
-        let mut state = lock(&self.state)?;
-        if let Some(s) = state.as_mut() {
-            s.tasks.ensure_current()?;
-            s.approvals.ensure_current()?;
-            s.knowledge.close().map_err(service)?;
-            let releasable = s.tasks.tasks.values().all(|task| task.stage.terminal())
-                && s.approvals.list().iter().all(|record| {
-                    !matches!(
-                        record.state,
-                        ApprovalState::Executing | ApprovalState::Unknown
-                    )
-                });
-            if releasable && let Some(lease) = lock(&self.ownership)?.as_mut() {
-                lease.release()?;
+                permit,
+                approval,
+                observation,
+                incident,
+                authority,
+            } => {
+                if permit.request_id() != approval.request.request_id
+                    || permit.operation() != &approval.request.operation
+                    || permit.revision() != approval.revision
+                {
+                    return Err(invalid("permit and durable approval differ"));
+                }
+                (
+                    RecoveryEvent::ExecutionAuthorized {
+                        task_id,
+                        revision,
+                        approval,
+                        observation,
+                        incident,
+                        authority,
+                    },
+                    Some(permit),
+                )
             }
+        };
+        // Current knowledge authority is checked live; historical replay validates
+        // the original evidence without retroactively applying newer isolation.
+        match &event {
+            RecoveryEvent::SelectPlan {
+                task_id,
+                observation,
+                candidate: Some(record),
+                ..
+            } => {
+                let task = self
+                    .tasks
+                    .get(task_id)
+                    .ok_or_else(|| invalid("task not found"))?;
+                let matches = knowledge.search_reusable(&KnowledgeQuery {
+                    conditions: self.conditions(task, observation)?,
+                    keywords: task.problem.keywords.clone(),
+                    limit: 100,
+                })?;
+                if !matches.iter().any(|item| item == record) {
+                    return Err(invalid("candidate is not current reusable knowledge"));
+                }
+            }
+            RecoveryEvent::DiagnosisCompleted { plan, .. } => {
+                knowledge.validate_script(&plan.script)?
+            }
+            RecoveryEvent::ExecutionAuthorized { task_id, .. } => {
+                let plan = self
+                    .tasks
+                    .get(task_id)
+                    .and_then(|t| t.plan.as_ref())
+                    .ok_or_else(|| invalid("missing plan"))?;
+                knowledge.validate_script(&plan.script)?;
+                if knowledge.is_quarantined(&plan.script.id, plan.script.version) {
+                    return Err(invalid("script version quarantined"));
+                }
+            }
+            _ => {}
         }
-        state.take();
-        lock(&self.ownership)?.take();
+        let id = commit_id.into();
+        if self.entries.iter().any(|entry| entry.request.id == id) {
+            return Err(invalid(
+                "commit identity already applied; read prior result",
+            ));
+        }
+        let input = self.commit_input(&event, now_ms)?;
+        let mut next = self.clone();
+        let effects = next.apply(&event, now_ms, permit)?;
+        next.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(RecoveryError::Capacity)?;
+        next.updated_at_ms = now_ms;
+        let request =
+            CommitRequest::new(id.clone(), self.revision, "recovery".into(), input.clone())?;
+        next.entries.push(RecoveryEntry {
+            request,
+            now_ms,
+            event,
+        });
+        Ok(Prepared::new_bound(
+            id,
+            self.revision,
+            "recovery".into(),
+            input,
+            next,
+            effects,
+        )?)
+    }
+
+    /// Host supplies complete, committed history from protected storage. Replay
+    /// never returns effects/permits. Persist Recover before resuming any work.
+    pub fn restore(
+        config: RecoveryConfig,
+        entries: &[RecoveryEntry],
+    ) -> Result<Self, RecoveryError> {
+        let mut state = Self::new(config)?;
+        let mut ids = BTreeSet::new();
+        for entry in entries {
+            if !crate::identity::valid_id(&entry.request.id)
+                || !ids.insert(entry.request.id.clone())
+                || entry.request.expected_revision != state.revision
+                || Some(entry.request.revision) != state.revision.checked_add(1)
+            {
+                return Err(invalid("invalid recovery history order or identity"));
+            }
+            let expected = CommitRequest::new(
+                entry.request.id.clone(),
+                state.revision,
+                "recovery".into(),
+                state.commit_input(&entry.event, entry.now_ms)?,
+            )?;
+            if entry.request != expected {
+                return Err(invalid("recovery commit content differs from history"));
+            }
+            state.apply(&entry.event, entry.now_ms, None)?;
+            state.revision = entry.request.revision;
+            state.updated_at_ms = entry.now_ms;
+            state.entries.push(entry.clone());
+        }
+        state.recovery_required = true;
+        Ok(state)
+    }
+
+    fn commit_input(
+        &self,
+        event: &RecoveryEvent,
+        now: u64,
+    ) -> Result<serde_json::Value, RecoveryError> {
+        serde_json::to_value((
+            &self.config,
+            self.revision,
+            self.updated_at_ms,
+            &self.tasks,
+            &self.deliveries,
+            &self.quarantined,
+            self.scripts.values().collect::<Vec<_>>(),
+            &self.candidates,
+            event,
+            now,
+        ))
+        .map_err(|_| invalid("cannot encode bounded domain commit"))
+    }
+    fn mark_unknown(
+        &mut self,
+        task: &mut RecoveryTask,
+        now: u64,
+    ) -> Result<Option<RecoveryEffect>, RecoveryError> {
+        let op = task
+            .operation
+            .as_ref()
+            .ok_or_else(|| invalid("missing original operation"))?;
+        let delivery_id = format!("{}-Unknown", op.operation_id);
+        if task.receipt.is_none() {
+            task.receipt = Some(ScriptReceipt {
+                operation_id: op.operation_id.clone(),
+                target_id: op.target.clone(),
+                outcome: ScriptOutcome::Unknown,
+                executor_stopped: false,
+                evidence_refs: vec![format!(
+                    "approval:{}",
+                    task.approval_id.as_deref().unwrap_or("unknown")
+                )],
+                summary: "interrupted or consumed execution; independent evidence required".into(),
+            });
+        }
+        task.stage = RecoveryStage::Unknown;
+        if self.deliveries.contains_key(&delivery_id) {
+            return Ok(None);
+        }
+        Ok(Some(self.finish(task, RepairOutcome::Unknown, now)?))
+    }
+    fn current(&self, id: &str, revision: u64) -> Result<RecoveryTask, RecoveryError> {
+        let task = self
+            .tasks
+            .get(id)
+            .ok_or_else(|| invalid("task not found"))?;
+        if task.revision != revision {
+            return Err(RecoveryError::Conflict);
+        }
+        Ok(task.clone())
+    }
+    fn save_task(&mut self, mut task: RecoveryTask, now: u64) -> Result<(), RecoveryError> {
+        task.revision = task
+            .revision
+            .checked_add(1)
+            .ok_or(RecoveryError::Capacity)?;
+        task.updated_at_ms = now;
+        self.tasks.insert(task.id.clone(), task);
         Ok(())
     }
-    fn policy<'a>(&'a self, task: &RecoveryTask) -> &'a approval::ApprovalPolicy {
-        if task.reused_script {
-            &self.config.script_approval
-        } else {
-            &self.config.approval
-        }
-    }
-    async fn inspect(
-        &self,
-        cancellation: Cancellation,
-    ) -> Result<TargetObservation, RecoveryError> {
-        let observation = self
-            .backend
-            .inspect(&self.config.target, cancellation)
-            .await?;
-        facts(&observation.facts)?;
-        evidence(&observation.evidence_refs)?;
-        let now = self.clock.now_ms();
-        if observation.target_id != self.config.target.target_id
-            || observation.observed_at_ms > now
-            || now.saturating_sub(observation.observed_at_ms) > 30_000
+    fn observe(&self, observed: &TargetObservation, now: u64) -> Result<(), RecoveryError> {
+        facts(&observed.facts)?;
+        evidence(&observed.evidence_refs)?;
+        if observed.target_id != self.config.target.target_id
+            || observed.observed_at_ms > now
+            || now - observed.observed_at_ms > 30_000
             || self
                 .config
                 .target
                 .required_facts
                 .iter()
-                .any(|(k, v)| observation.facts.get(k) != Some(v))
+                .any(|(k, v)| observed.facts.get(k) != Some(v))
         {
-            return Err(RecoveryError::Invalid(
-                "target observation stale or outside trusted conditions".into(),
-            ));
+            return Err(invalid("stale observation or target conditions changed"));
         }
-        Ok(observation)
+        Ok(())
     }
     fn conditions(
         &self,
@@ -562,33 +478,29 @@ impl RecoveryService {
         observed: &TargetObservation,
     ) -> Result<BTreeMap<String, String>, RecoveryError> {
         let mut values = observed.facts.clone();
-        for (key, value) in &task.problem.conditions {
-            if values.get(key) != Some(value) {
-                return Err(RecoveryError::Invalid(
-                    "incident environment changed or required fact is missing".into(),
-                ));
-            }
-            values.insert(key.clone(), value.clone());
+        if task
+            .problem
+            .conditions
+            .iter()
+            .any(|(k, v)| values.get(k) != Some(v))
+        {
+            return Err(invalid("incident environment changed"));
         }
         values.insert("fault_fingerprint".into(), task.problem.fingerprint.clone());
         values.insert("platform".into(), self.config.target.platform.clone());
         facts(&values)?;
         Ok(values)
     }
-    fn validate_plan(
-        &self,
+    fn plan(
+        &mut self,
         plan: &RepairPlan,
         observation: &TargetObservation,
     ) -> Result<(), RecoveryError> {
         text(&plan.summary, 4096)?;
         let script = &plan.script;
-        self.state(|s| s.knowledge.validate_script(script).map_err(service))?;
-        text(&script.source, MAX_SCRIPT_BYTES)?;
-        text(&script.id, 128)?;
-        facts(&script.preconditions)?;
-        if script.version == 0
-            || script.preconditions.is_empty()
-            || script.platform != self.config.target.platform
+        // Reuse the knowledge domain's bounded immutable script validator.
+        KnowledgeState::new(KnowledgeConfig::default())?.validate_script(script)?;
+        if script.platform != self.config.target.platform
             || !self
                 .config
                 .target
@@ -598,387 +510,49 @@ impl RecoveryService {
                 .preconditions
                 .iter()
                 .any(|(k, v)| observation.facts.get(k) != Some(v))
+            || self.is_quarantined(&script.id, script.version)
         {
-            return Err(RecoveryError::Invalid(
-                "script platform, language or preconditions do not match current target".into(),
+            return Err(invalid("script conditions or version not eligible"));
+        }
+        let key = (script.id.clone(), script.version);
+        if self.scripts.get(&key).is_some_and(|old| old != script) {
+            return Err(invalid("script version content changed"));
+        }
+        self.scripts.insert(key, script.clone());
+        Ok(())
+    }
+    fn policy(&self, task: &RecoveryTask) -> &approval::ApprovalPolicy {
+        if task.reused_script {
+            &self.config.script_approval
+        } else {
+            &self.config.approval
+        }
+    }
+    fn bind_approval(
+        &self,
+        task: &RecoveryTask,
+        record: &ApprovalRecord,
+    ) -> Result<(), RecoveryError> {
+        if task.operation.as_ref() != Some(&record.request.operation)
+            || self.policy(task) != &record.request.policy
+            || task
+                .approval_id
+                .as_ref()
+                .is_some_and(|id| id != &record.request.request_id)
+        {
+            return Err(invalid(
+                "approval does not bind original intent and current policy",
             ));
+        }
+        record.request.operation.validate()?;
+        record.request.policy.validate()?;
+        if !record.request.policy.allows(&record.request.operation) {
+            return Err(invalid("operation outside hard policy"));
         }
         Ok(())
     }
-    async fn drive(
-        &self,
-        id: &str,
-        cancellation: Cancellation,
-    ) -> Result<RecoveryTask, RecoveryError> {
-        for _ in 0..64 {
-            self.check_ownership()?;
-            let mut task = self.task(id)?;
-            // A request or association failure must retry this saved intent,
-            // including cancellation, rather than consume another diagnosis.
-            if task.stage == RecoveryStage::AwaitingApproval && task.approval_id.is_none() {
-                task = self.state(|s| {
-                    attach_approval(
-                        &mut s.tasks,
-                        &mut s.approvals,
-                        &self.config,
-                        task,
-                        self.clock.now_ms(),
-                    )
-                })?;
-            }
-            if task.stage.terminal()
-                || matches!(task.stage, RecoveryStage::Unknown | RecoveryStage::Paused)
-            {
-                return Ok(task);
-            }
-            if cancellation.is_cancelled()
-                && !matches!(
-                    task.stage,
-                    RecoveryStage::Verifying | RecoveryStage::Publishing | RecoveryStage::Executing
-                )
-            {
-                if let Some(approval_id) = &task.approval_id {
-                    self.state(|s| {
-                        if s.approvals.get(approval_id).is_some_and(|r| {
-                            matches!(
-                                r.state,
-                                ApprovalState::Pending
-                                    | ApprovalState::WaitingHuman
-                                    | ApprovalState::Approved
-                            )
-                        }) {
-                            s.approvals.cancel(
-                                approval_id,
-                                "workflow canceled before execution".into(),
-                                self.clock.now_ms() / 1000,
-                            )?;
-                        }
-                        Ok(())
-                    })?;
-                }
-                task.stage = RecoveryStage::Canceled;
-                return self.save(task);
-            }
-            match task.stage {
-                RecoveryStage::Queued => {
-                    let observed = self.inspect(cancellation.clone()).await?;
-                    let conditions = self.conditions(&task, &observed)?;
-                    let candidates = self.state(|s| {
-                        if task.episode_count < self.config.minimum_script_occurrences {
-                            return Ok(Vec::new());
-                        }
-                        s.knowledge
-                            .search_reusable(&KnowledgeQuery {
-                                conditions,
-                                keywords: task.problem.keywords.clone(),
-                                limit: 1,
-                            })
-                            .map_err(service)
-                    })?;
-                    task.observation = Some(observed.clone());
-                    if let Some(candidate) = candidates.first() {
-                        let plan = RepairPlan {
-                            summary: candidate.candidate.summary.clone(),
-                            script: candidate.candidate.script.clone(),
-                            reusable: true,
-                        };
-                        self.validate_plan(&plan, &observed)?;
-                        task.plan = Some(plan);
-                        task.knowledge_id = Some(candidate.id.clone());
-                        task.reused_script = true;
-                        self.request_plan(task)?;
-                    } else {
-                        task.stage = RecoveryStage::Diagnosing;
-                        self.save(task)?;
-                    }
-                }
-                RecoveryStage::Diagnosing => {
-                    if task.diagnosis_attempts >= self.config.max_diagnoses {
-                        task.stage = RecoveryStage::Failed;
-                        task.note = Some("diagnosis budget exhausted".into());
-                        return self.save(task);
-                    }
-                    let observed = self.inspect(cancellation.clone()).await?;
-                    let conditions = self.conditions(&task, &observed)?;
-                    let query = KnowledgeQuery {
-                        conditions,
-                        keywords: task.problem.keywords.clone(),
-                        limit: 4,
-                    };
-                    let mut knowledge: Vec<_> = self
-                        .state(|s| s.knowledge.search(&query).map_err(service))?
-                        .into_iter()
-                        .map(|record| record.candidate)
-                        .collect();
-                    if let Some(source) = self.knowledge_source.get() {
-                        let proposals = source
-                            .source
-                            .query(query.clone(), cancellation.clone())
-                            .await;
-                        if cancellation.is_cancelled() {
-                            continue;
-                        }
-                        let candidates = match proposals {
-                            Ok(proposals) => self.state(|s| {
-                                s.knowledge
-                                    .validate_external_candidates(
-                                        &source.identity,
-                                        &query,
-                                        proposals,
-                                    )
-                                    .map_err(service)
-                            }),
-                            Err(_) => Err(service("knowledge source request failed")),
-                        };
-                        match candidates {
-                            Ok(candidates) => {
-                                for candidate in candidates {
-                                    if !knowledge.iter().any(|old| old.id == candidate.id) {
-                                        knowledge.push(candidate);
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                task.note =
-                                    Some(format!("external knowledge unavailable: {error}"));
-                            }
-                        }
-                    }
-                    task.diagnosis_attempts += 1;
-                    task.observation = Some(observed.clone());
-                    task = self.save(task)?;
-                    let plan = self
-                        .backend
-                        .diagnose(
-                            DiagnosisInput {
-                                task: task.clone(),
-                                config: self.config.clone(),
-                                observation: observed.clone(),
-                                knowledge,
-                            },
-                            cancellation.clone(),
-                        )
-                        .await?;
-                    self.validate_plan(&plan, &observed)?;
-                    if plan.script.generated_by_harness != self.config.execution_harness {
-                        return Err(RecoveryError::Invalid(
-                            "script producer differs from execution Harness".into(),
-                        ));
-                    }
-                    text(&plan.script.generated_in_session, 256)?;
-                    task.plan = Some(plan);
-                    task.reused_script = false;
-                    task.knowledge_id = None;
-                    task.receipt = None;
-                    task.verification = None;
-                    self.request_plan(task)?;
-                }
-                RecoveryStage::AwaitingApproval => {
-                    let record = self
-                        .approval(id)?
-                        .ok_or_else(|| service("missing durable approval"))?;
-                    if record.state == ApprovalState::Approved {
-                        self.execute_task(task, cancellation.clone()).await?;
-                    } else if matches!(
-                        record.state,
-                        ApprovalState::Denied
-                            | ApprovalState::Expired
-                            | ApprovalState::Revoked
-                            | ApprovalState::Canceled
-                    ) {
-                        let alternative = if task.reused_script {
-                            cached_script_denial_context(&record)
-                        } else {
-                            None
-                        };
-                        if let Some(context) = alternative {
-                            task.note = Some(context);
-                            task.reused_script = false;
-                            task.knowledge_id = None;
-                            task.approval_id = None;
-                            task.operation = None;
-                            task.stage = RecoveryStage::Diagnosing;
-                            self.save(task)?;
-                        } else {
-                            task.stage = RecoveryStage::Denied;
-                            return self.save(task);
-                        }
-                    } else if record.state == ApprovalState::Unknown
-                        || record.state == ApprovalState::Executing
-                    {
-                        task.stage = RecoveryStage::Unknown;
-                        return self.save(task);
-                    } else {
-                        let now = self.clock.now_ms() / 1000;
-                        if now >= record.request.expires_at {
-                            match self.state(|s| {
-                                Ok(s.approvals.expire_review(
-                                    &record.request.request_id,
-                                    record.revision,
-                                    self.policy(&task),
-                                    now,
-                                )?)
-                            }) {
-                                Ok(_)
-                                | Err(RecoveryError::Approval(approval::ApprovalError::Expired)) => {
-                                }
-                                Err(error) => return Err(error),
-                            }
-                            task.stage = RecoveryStage::Denied;
-                            return self.save(task);
-                        }
-                        if record.review_stage == ReviewStage::NeedsHuman {
-                            return Ok(task);
-                        }
-                        if record.review_stage == ReviewStage::WaitingHuman
-                            && record.human_deadline.is_some_and(|deadline| now < deadline)
-                        {
-                            return Ok(task);
-                        }
-                        if record.review_stage == ReviewStage::ReviewingHarness {
-                            if record
-                                .review_deadline
-                                .is_some_and(|deadline| now >= deadline)
-                            {
-                                self.state(|s| {
-                                    Ok(s.approvals.expire_review(
-                                        &record.request.request_id,
-                                        record.revision,
-                                        self.policy(&task),
-                                        now,
-                                    )?)
-                                })?;
-                            }
-                            return Ok(task);
-                        }
-                        let observed = self.inspect(cancellation.clone()).await?;
-                        self.validate_plan(
-                            task.plan.as_ref().ok_or_else(|| service("missing plan"))?,
-                            &observed,
-                        )?;
-                        let timeout = match self.policy(&task).reviewer {
-                            approval::ReviewerConfig::HumanThenHarness {
-                                review_timeout_secs,
-                                ..
-                            } => self.config.review_timeout_secs.min(review_timeout_secs),
-                            _ => self.config.review_timeout_secs,
-                        };
-                        let attempt = self.state(|s| {
-                            Ok(s.approvals.begin_harness_review(
-                                &record.request.request_id,
-                                record.revision,
-                                self.policy(&task),
-                                timeout,
-                                self.clock.now_ms() / 1000,
-                            )?)
-                        })?;
-                        let result = self
-                            .backend
-                            .review(
-                                ReviewInput {
-                                    request: record.request,
-                                    attempt: attempt.clone(),
-                                    observation: observed,
-                                    reused_script: task.reused_script,
-                                },
-                                cancellation.clone(),
-                            )
-                            .await;
-                        let saved = self.state(|s| match result {
-                            Ok(response) => Ok(s.approvals.assess_attempt(
-                                &attempt,
-                                response.assessment,
-                                response.identity,
-                                self.policy(&task),
-                                self.clock.now_ms() / 1000,
-                            )?),
-                            Err(error) => Ok(s.approvals.fail_review_attempt(
-                                &attempt,
-                                error.to_string(),
-                                self.policy(&task),
-                                self.clock.now_ms() / 1000,
-                            )?),
-                        });
-                        match saved {
-                            Ok(_)
-                            | Err(RecoveryError::Approval(
-                                approval::ApprovalError::Expired
-                                | approval::ApprovalError::ReviewTimedOut,
-                            )) => (),
-                            Err(RecoveryError::Approval(approval::ApprovalError::Conflict)) => {
-                                self.state(|s| {
-                                    if s.approvals
-                                        .get(&attempt.request_id)
-                                        .and_then(|r| r.active_review_attempt())
-                                        .as_ref()
-                                        == Some(&attempt)
-                                    {
-                                        s.approvals.fail_review_attempt(
-                                            &attempt,
-                                            "review response identity or request mismatch".into(),
-                                            self.policy(&task),
-                                            self.clock.now_ms() / 1000,
-                                        )?;
-                                    }
-                                    Ok(())
-                                })?;
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    }
-                }
-                RecoveryStage::Executing => {
-                    task.stage = RecoveryStage::Unknown;
-                    return self.save(task);
-                }
-                RecoveryStage::Verifying => {
-                    let operation = task
-                        .operation
-                        .clone()
-                        .ok_or_else(|| service("missing operation"))?;
-                    let receipt = task
-                        .receipt
-                        .clone()
-                        .ok_or_else(|| service("missing receipt"))?;
-                    // Verification has its own read-only invocation; cancellation never implies health.
-                    let result = self
-                        .backend
-                        .verify(
-                            VerificationInput {
-                                target: self.config.target.clone(),
-                                operation: operation.clone(),
-                                receipt,
-                            },
-                            cancellation.clone(),
-                        )
-                        .await;
-                    match result {
-                        Ok(verification) => {
-                            match self.validate_verification(&task, &verification) {
-                                Ok(()) => task.verification = Some(verification),
-                                Err(error) => {
-                                    task.note =
-                                        Some(format!("business verification rejected: {error}"))
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            task.note = Some(format!("business verification unavailable: {error}"));
-                        }
-                    }
-                    task.stage = RecoveryStage::Publishing;
-                    self.save(task)?;
-                }
-                RecoveryStage::Publishing => {
-                    self.publish(task)?;
-                }
-                _ => return Ok(task),
-            }
-        }
-        Err(service("recovery transition budget exhausted"))
-    }
-    fn request_plan(&self, mut task: RecoveryTask) -> Result<RecoveryTask, RecoveryError> {
-        let plan = task.plan.as_ref().ok_or_else(|| service("missing plan"))?;
+    fn request_plan(&self, task: &mut RecoveryTask) -> Result<RecoveryEffect, RecoveryError> {
+        let plan = task.plan.as_ref().ok_or_else(|| invalid("missing plan"))?;
         let operation = approval::ProposedOperation {
             task_id: task.id.clone(),
             task_revision: task.revision,
@@ -993,554 +567,855 @@ impl RecoveryService {
                 }
             ),
             target: task.problem.target_id.clone(),
-            action: serde_json::json!({"kind":"execute_script","executor_id":self.config.target.executor_id,
-                "script":plan.script,"verification_profile":self.config.target.verification_profile,
-                "required_facts":self.config.target.required_facts,"timeout_secs":self.config.target.action_timeout_secs,
-                "incident_id":task.problem.incident_id,"incident_revision":task.problem.incident_revision}),
+            action: serde_json::json!({"kind":"execute_script", "executor_id":self.config.target.executor_id, "script":plan.script, "verification_profile":self.config.target.verification_profile, "required_facts":self.config.target.required_facts, "timeout_secs":self.config.target.action_timeout_secs, "incident_id":task.problem.incident_id, "incident_revision":task.problem.incident_revision}),
         };
-        task.operation = Some(operation);
+        operation.validate()?;
+        task.operation = Some(operation.clone());
         task.approval_id = None;
         task.result_check = None;
         task.stage = RecoveryStage::AwaitingApproval;
-        // The complete plan and stable operation precede the approval commit.
-        // Neither request retries nor restart recovery rebuild this operation.
-        let task = self.save(task)?;
-        self.state(|s| {
-            attach_approval(
-                &mut s.tasks,
-                &mut s.approvals,
-                &self.config,
-                task,
-                self.clock.now_ms(),
-            )
+        Ok(RecoveryEffect::RequestApproval {
+            operation,
+            policy: self.policy(task).clone(),
         })
     }
-    async fn execute_task(
+    fn diagnose(
         &self,
-        mut task: RecoveryTask,
-        cancellation: Cancellation,
-    ) -> Result<(), RecoveryError> {
-        if !self.check_incident_before_execution(&task)? {
-            return Ok(());
+        task: &mut RecoveryTask,
+        now: u64,
+    ) -> Result<Option<RecoveryEffect>, RecoveryError> {
+        if task.diagnosis_attempts >= self.config.max_diagnoses {
+            task.stage = RecoveryStage::Failed;
+            task.note = Some("diagnosis budget exhausted".into());
+            return Ok(None);
         }
-        let observed = self.inspect(cancellation.clone()).await?;
-        self.conditions(&task, &observed)?;
-        self.validate_plan(
-            task.plan.as_ref().ok_or_else(|| service("missing plan"))?,
-            &observed,
-        )?;
-        if cancellation.is_cancelled() {
-            return Ok(());
+        task.diagnosis_attempts += 1;
+        task.stage = RecoveryStage::Diagnosing;
+        let call_id = format!("{}-diagnosis-{}", task.id, task.diagnosis_attempts);
+        task.diagnosis_call = Some(call_id.clone());
+        let mut callback_task = task.clone();
+        callback_task.revision = callback_task
+            .revision
+            .checked_add(1)
+            .ok_or(RecoveryError::Capacity)?;
+        callback_task.updated_at_ms = now;
+        Ok(Some(RecoveryEffect::Diagnose {
+            task: Box::new(callback_task),
+            call_id,
+            timeout_secs: self.config.diagnosis_timeout_secs,
+            max_tool_calls: self.config.max_tool_calls,
+        }))
+    }
+    fn apply(
+        &mut self,
+        event: &RecoveryEvent,
+        now: u64,
+        permit: Option<ExecutionPermit>,
+    ) -> Result<Vec<RecoveryEffect>, RecoveryError> {
+        if now < self.updated_at_ms {
+            return Err(invalid("clock moved backwards"));
         }
-        let operation = task
-            .operation
-            .clone()
-            .ok_or_else(|| service("missing operation"))?;
-        let id = task
-            .approval_id
-            .clone()
-            .ok_or_else(|| service("missing approval"))?;
-        // Final observation and one-use authorization share the source's gate.
-        // No remote await or action runs while that gate is held.
-        let problem = task.problem.clone();
-        let guard = self
-            .incident_guard
-            .get()
-            .ok_or_else(|| service("missing incident guard"))?;
-        let mut checked = false;
-        let mut permit = None;
-        guard.with_current(&problem, &mut |readiness| {
-            self.check_ownership()?;
-            if checked {
-                return Err(service(
-                    "incident guard repeated its authorization callback",
-                ));
+        let mut effects = Vec::new();
+        match event {
+            RecoveryEvent::Register { problem, incident } => {
+                problem.validate()?;
+                if problem.target_id != self.config.target.target_id {
+                    return Err(invalid("wrong target"));
+                }
+                if let Some(old) = self
+                    .tasks
+                    .values()
+                    .find(|t| t.problem.incident_id == problem.incident_id)
+                {
+                    if old.problem.target_id != problem.target_id
+                        || old.problem.fingerprint != problem.fingerprint
+                    {
+                        return Err(invalid("incident identity changed"));
+                    }
+                    return Ok(effects);
+                }
+                if incident.incident_id != problem.incident_id
+                    || incident.revision != problem.incident_revision
+                    || !incident.active
+                {
+                    return Err(invalid("current active incident required"));
+                }
+                if self.tasks.values().any(|task| !task.stage.terminal()) {
+                    return Err(RecoveryError::Busy);
+                }
+                if self.tasks.len() >= self.config.max_tasks {
+                    return Err(RecoveryError::Capacity);
+                }
+                let episode_count = self
+                    .tasks
+                    .values()
+                    .filter(|t| {
+                        t.problem.fingerprint == problem.fingerprint
+                            && t.problem.conditions == problem.conditions
+                    })
+                    .count() as u64
+                    + 1;
+                let task = RecoveryTask {
+                    id: format!(
+                        "task-{:016x}",
+                        self.revision
+                            .checked_add(1)
+                            .ok_or(RecoveryError::Capacity)?
+                    ),
+                    revision: 0,
+                    problem: problem.clone(),
+                    episode_count,
+                    stage: RecoveryStage::Queued,
+                    diagnosis_attempts: 0,
+                    plan: None,
+                    knowledge_id: None,
+                    reused_script: false,
+                    approval_id: None,
+                    operation: None,
+                    observation: None,
+                    receipt: None,
+                    verification: None,
+                    result_check: None,
+                    note: None,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                    diagnosis_call: None,
+                };
+                self.save_task(task, now)?;
             }
-            checked = true;
-            if !self.apply_incident_readiness(&task, readiness)? || cancellation.is_cancelled() {
-                return Ok(());
-            }
-            // Persist intent before authority; a crash never replays the action.
-            task.stage = RecoveryStage::Executing;
-            task.observation = Some(observed.clone());
-            task = self.save(task.clone())?;
-            match self.state(|s| {
-                Ok(s.approvals.consume(
-                    &id,
-                    &operation,
-                    self.policy(&task),
-                    self.clock.now_ms() / 1000,
-                )?)
-            }) {
-                Ok(consumed) => permit = Some(consumed),
-                Err(error) => {
-                    task.stage = if matches!(
-                        error,
-                        RecoveryError::Approval(
-                            approval::ApprovalError::Io(_)
-                                | approval::ApprovalError::Unavailable
-                                | approval::ApprovalError::Corrupt(_)
-                        )
-                    ) {
-                        RecoveryStage::Unknown
-                    } else {
-                        RecoveryStage::Denied
+            RecoveryEvent::SelectPlan {
+                task_id,
+                revision,
+                observation,
+                candidate,
+            } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage != RecoveryStage::Queued {
+                    return Err(RecoveryError::Conflict);
+                }
+                self.observe(observation, now)?;
+                let conditions = self.conditions(&task, observation)?;
+                task.observation = Some(observation.clone());
+                if let Some(record) = candidate {
+                    if task.episode_count < self.config.minimum_script_occurrences
+                        || !record.candidate.reusable
+                        || record.status != KnowledgeStatus::Verified
+                        || record.disabled.is_some()
+                        || record.cases.is_empty()
+                        || record.cases.iter().any(|c| {
+                            c.result.outcome != RepairOutcome::Verified || c.verification.is_none()
+                        })
+                        || record
+                            .candidate
+                            .conditions
+                            .iter()
+                            .any(|(k, v)| conditions.get(k) != Some(v))
+                        || !task
+                            .problem
+                            .keywords
+                            .iter()
+                            .all(|word| record.candidate.keywords.contains(word))
+                    {
+                        return Err(invalid("knowledge evidence not reusable"));
+                    }
+                    // Revalidate complete candidate/case provenance through the knowledge reducer.
+                    let mut checked = KnowledgeState::new(KnowledgeConfig {
+                        max_records: 1,
+                        max_cases_per_record: 1024,
+                    })?;
+                    let pending = checked.propose(
+                        "validate-candidate",
+                        KnowledgeCommand::UpsertCandidate(record.candidate.clone()),
+                    )?;
+                    checked = pending.state().clone();
+                    for (index, case) in record.cases.iter().enumerate() {
+                        let v = case
+                            .verification
+                            .as_ref()
+                            .ok_or_else(|| invalid("missing trusted verification"))?;
+                        let proof = TrustedBusinessVerification::attest(
+                            &v.operation_id,
+                            &v.target_id,
+                            &v.script_id,
+                            v.script_version,
+                            &v.verifier_id,
+                            v.evidence_refs.clone(),
+                            v.verified_at_ms,
+                        )?;
+                        checked = checked
+                            .propose(
+                                format!("validate-case-{index}"),
+                                KnowledgeCommand::RecordOutcome {
+                                    record_id: record.id.clone(),
+                                    case: case.result.clone(),
+                                    verification: Some(proof),
+                                },
+                            )?
+                            .state()
+                            .clone();
+                    }
+                    if record.id != record.candidate.id {
+                        return Err(invalid("candidate identity mismatch"));
+                    }
+                    let plan = RepairPlan {
+                        summary: record.candidate.summary.clone(),
+                        script: record.candidate.script.clone(),
+                        reusable: true,
                     };
-                    task.note = Some(error.to_string());
-                    task = self.save(task.clone())?;
+                    self.plan(&plan, observation)?;
+                    self.candidates
+                        .insert(record.id.clone(), record.candidate.clone());
+                    task.plan = Some(plan);
+                    task.knowledge_id = Some(record.id.clone());
+                    task.reused_script = true;
+                    effects.push(self.request_plan(&mut task)?);
+                } else if let Some(effect) = self.diagnose(&mut task, now)? {
+                    effects.push(effect);
+                }
+                self.save_task(task, now)?;
+            }
+            RecoveryEvent::RetryDiagnosis {
+                task_id,
+                revision,
+                observation,
+            } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage != RecoveryStage::Diagnosing || task.diagnosis_call.is_some() {
+                    return Err(RecoveryError::Conflict);
+                }
+                self.observe(observation, now)?;
+                self.conditions(&task, observation)?;
+                task.observation = Some(observation.clone());
+                if let Some(effect) = self.diagnose(&mut task, now)? {
+                    effects.push(effect);
+                }
+                self.save_task(task, now)?;
+            }
+            RecoveryEvent::DiagnosisCompleted {
+                task_id,
+                revision,
+                call_id,
+                plan,
+            } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage != RecoveryStage::Diagnosing
+                    || task.diagnosis_call.as_ref() != Some(call_id)
+                {
+                    return Err(RecoveryError::Conflict);
+                }
+                self.plan(
+                    plan,
+                    task.observation
+                        .as_ref()
+                        .ok_or_else(|| invalid("missing observation"))?,
+                )?;
+                if plan.script.generated_by_harness != self.config.execution_harness {
+                    return Err(invalid("unexpected diagnosis Harness"));
+                }
+                task.diagnosis_call = None;
+                task.plan = Some(plan.clone());
+                task.reused_script = false;
+                task.knowledge_id = None;
+                task.receipt = None;
+                task.verification = None;
+                effects.push(self.request_plan(&mut task)?);
+                self.save_task(task, now)?;
+            }
+            RecoveryEvent::DiagnosisFailed {
+                task_id,
+                revision,
+                call_id,
+                reason,
+            } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage != RecoveryStage::Diagnosing
+                    || task.diagnosis_call.as_ref() != Some(call_id)
+                {
+                    return Err(RecoveryError::Conflict);
+                }
+                text(reason, 8192)?;
+                task.note = Some(reason.clone());
+                task.diagnosis_call = None;
+                if task.diagnosis_attempts >= self.config.max_diagnoses {
+                    task.stage = RecoveryStage::Failed;
+                }
+                self.save_task(task, now)?;
+            }
+            RecoveryEvent::ApprovalAttached {
+                task_id,
+                revision,
+                record,
+            } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage != RecoveryStage::AwaitingApproval || task.approval_id.is_some() {
+                    return Err(RecoveryError::Conflict);
+                }
+                self.bind_approval(&task, record)?;
+                task.approval_id = Some(record.request.request_id.clone());
+                if matches!(
+                    record.state,
+                    ApprovalState::Executing
+                        | ApprovalState::Unknown
+                        | ApprovalState::Executed
+                        | ApprovalState::Failed
+                ) && let Some(effect) = self.mark_unknown(&mut task, now)?
+                {
+                    effects.push(effect);
+                }
+                self.save_task(task, now)?;
+            }
+            RecoveryEvent::ApprovalResolved {
+                task_id,
+                revision,
+                record,
+            } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage != RecoveryStage::AwaitingApproval || task.approval_id.is_none() {
+                    return Err(RecoveryError::Conflict);
+                }
+                self.bind_approval(&task, record)?;
+                match record.state {
+                    ApprovalState::Denied
+                    | ApprovalState::Expired
+                    | ApprovalState::Canceled
+                    | ApprovalState::Revoked => {
+                        let alternative = task.reused_script
+                            && record.state == ApprovalState::Denied
+                            && record.assessment.as_ref().is_some_and(|a| {
+                                a.decision == approval::ApprovalDecision::Deny
+                                    && matches!(
+                                        a.reviewer,
+                                        approval::AssessmentSource::Harness { .. }
+                                    )
+                            });
+                        if alternative {
+                            task.note = record.assessment.as_ref().map(|a| a.reason.clone());
+                            self.reset_attempt(&mut task);
+                            task.stage = RecoveryStage::Diagnosing;
+                        } else {
+                            task.stage = RecoveryStage::Denied;
+                        }
+                    }
+                    ApprovalState::Executing
+                    | ApprovalState::Unknown
+                    | ApprovalState::Executed
+                    | ApprovalState::Failed => {
+                        if let Some(effect) = self.mark_unknown(&mut task, now)? {
+                            effects.push(effect);
+                        }
+                    }
+
+                    _ => {}
+                }
+                self.save_task(task, now)?;
+            }
+            RecoveryEvent::ExecutionAuthorized {
+                task_id,
+                revision,
+                approval,
+                observation,
+                incident,
+                authority,
+            } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage != RecoveryStage::AwaitingApproval || task.approval_id.is_none() {
+                    return Err(RecoveryError::Conflict);
+                }
+                self.bind_approval(&task, approval)?;
+                if approval.state != ApprovalState::Executing
+                    || now / 1000 >= approval.request.expires_at
+                    || approval.updated_at > now / 1000
+                {
+                    return Err(invalid("current consumed approval required"));
+                }
+                if authority.target_id != task.problem.target_id
+                    || !crate::identity::valid_id(&authority.epoch)
+                    || incident.incident_id != task.problem.incident_id
+                    || incident.revision < task.problem.incident_revision
+                    || !incident.active
+                {
+                    return Err(invalid("current incident and target ownership required"));
+                }
+                self.observe(observation, now)?;
+                self.conditions(&task, observation)?;
+                self.plan(
+                    task.plan.as_ref().ok_or_else(|| invalid("missing plan"))?,
+                    observation,
+                )?;
+                task.stage = RecoveryStage::Executing;
+                task.observation = Some(observation.clone());
+                self.save_task(task, now)?;
+                if let Some(permit) = permit {
+                    effects.push(RecoveryEffect::Execute {
+                        permit,
+                        authority: authority.clone(),
+                        timeout_secs: self.config.target.action_timeout_secs,
+                    });
                 }
             }
-            Ok(())
-        })?;
-        if !checked {
-            return Err(service("incident guard did not check current facts"));
-        }
-        let Some(permit) = permit else {
-            return Ok(());
-        };
-        let result = self
-            .backend
-            .execute(
-                AuthorizedScript {
-                    permit: &permit,
-                    timeout_secs: self.config.target.action_timeout_secs,
-                },
-                cancellation,
-            )
-            .await;
-        let mut receipt = match result {
-            Ok(receipt) => receipt,
-            Err(error) => ScriptReceipt {
-                operation_id: operation.operation_id.clone(),
-                target_id: operation.target.clone(),
-                outcome: ScriptOutcome::Unknown,
-                executor_stopped: false,
-                evidence_refs: vec![format!("approval:{id}")],
-                summary: error.to_string(),
-            },
-        };
-        if receipt.operation_id != operation.operation_id
-            || receipt.target_id != operation.target
-            || evidence(&receipt.evidence_refs).is_err()
-            || receipt.summary.len() > 8192
-            || !receipt.executor_stopped
-        {
-            receipt = ScriptReceipt {
-                operation_id: operation.operation_id.clone(),
-                target_id: operation.target.clone(),
-                outcome: ScriptOutcome::Unknown,
-                executor_stopped: false,
-                evidence_refs: vec![format!("approval:{id}")],
-                summary: "invalid receipt or executor not confirmed stopped".into(),
-            };
-        }
-        let outcome = match receipt.outcome {
-            ScriptOutcome::Executed => ExecutionOutcome::Executed,
-            ScriptOutcome::Failed => ExecutionOutcome::Failed,
-            ScriptOutcome::Unknown => ExecutionOutcome::Unknown,
-        };
-        self.state(|s| {
-            Ok(s.approvals.complete(
-                permit,
-                outcome,
-                receipt.summary.clone(),
-                self.clock.now_ms() / 1000,
-            )?)
-        })?;
-        task.stage = if receipt.outcome == ScriptOutcome::Executed {
-            RecoveryStage::Verifying
-        } else {
-            RecoveryStage::Publishing
-        };
-        task.receipt = Some(receipt);
-        self.save(task)?;
-        Ok(())
-    }
-    fn check_incident_before_execution(&self, task: &RecoveryTask) -> Result<bool, RecoveryError> {
-        let guard = self.incident_guard.get().ok_or_else(|| {
-            RecoveryError::Invalid("trusted incident guard required before execution".into())
-        })?;
-        self.apply_incident_readiness(task, guard.check(&task.problem)?)
-    }
-    fn apply_incident_readiness(
-        &self,
-        task: &RecoveryTask,
-        readiness: IncidentReadiness,
-    ) -> Result<bool, RecoveryError> {
-        match readiness {
-            IncidentReadiness::Active { revision }
-                if revision >= task.problem.incident_revision =>
-            {
-                Ok(true)
-            }
-            IncidentReadiness::Resolved { revision }
-                if revision >= task.problem.incident_revision =>
-            {
-                let request_id = task
-                    .approval_id
+            RecoveryEvent::ExecutionRecorded {
+                task_id,
+                revision,
+                receipt,
+                approval,
+            } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage != RecoveryStage::Executing {
+                    return Err(RecoveryError::Conflict);
+                }
+                self.bind_approval(&task, approval)?;
+                let op = task
+                    .operation
                     .as_ref()
-                    .ok_or_else(|| service("missing approval"))?;
-                self.state(|s| {
-                    let record = s
-                        .approvals
-                        .get(request_id)
-                        .ok_or_else(|| service("missing approval"))?;
-                    if matches!(
-                        record.state,
-                        ApprovalState::Executing | ApprovalState::Unknown
-                    ) {
-                        return Err(RecoveryError::Invalid(
-                            "dispatched operation requires result_check".into(),
-                        ));
-                    }
-                    if matches!(
-                        record.state,
-                        ApprovalState::Pending
-                            | ApprovalState::WaitingHuman
-                            | ApprovalState::Approved
-                    ) {
-                        s.approvals.cancel(
-                            request_id,
-                            "triggering incident resolved before execution".into(),
-                            self.clock.now_ms() / 1000,
-                        )?;
-                    }
-                    Ok(())
-                })?;
-                let mut canceled = task.clone();
-                canceled.stage = RecoveryStage::Canceled;
-                canceled.note = Some(format!(
-                    "triggering incident resolved at revision {revision}; unconsumed approval canceled"
-                ));
-                self.save(canceled)?;
-                Ok(false)
+                    .ok_or_else(|| invalid("missing operation"))?;
+                evidence(&receipt.evidence_refs)?;
+                text(&receipt.summary, 8192)?;
+                if receipt.operation_id != op.operation_id
+                    || receipt.target_id != op.target
+                    || (receipt.outcome != ScriptOutcome::Unknown && !receipt.executor_stopped)
+                {
+                    return Err(invalid(
+                        "execution receipt identity or stopping state mismatch",
+                    ));
+                }
+                let expected = match receipt.outcome {
+                    ScriptOutcome::Executed => ApprovalState::Executed,
+                    ScriptOutcome::Failed => ApprovalState::Failed,
+                    ScriptOutcome::Unknown => ApprovalState::Unknown,
+                };
+                if approval.state != expected {
+                    return Err(invalid("execution and approval facts differ"));
+                }
+                task.receipt = Some(receipt.clone());
+                if receipt.outcome == ScriptOutcome::Executed {
+                    task.stage = RecoveryStage::Verifying;
+                    effects.push(RecoveryEffect::Verify {
+                        task_id: task.id.clone(),
+                        operation: op.clone(),
+                        receipt: receipt.clone(),
+                    });
+                } else {
+                    let outcome = if receipt.outcome == ScriptOutcome::Failed {
+                        RepairOutcome::Failed
+                    } else {
+                        RepairOutcome::Unknown
+                    };
+                    effects.push(self.finish(&mut task, outcome, now)?);
+                }
+                self.save_task(task, now)?;
             }
-            IncidentReadiness::Unavailable { reason } => {
-                text(&reason, 8192)?;
-                Err(service(format!(
-                    "incident is not currently eligible for execution: {reason}"
-                )))
+            RecoveryEvent::VerificationRecorded {
+                task_id,
+                revision,
+                verification,
+            } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage != RecoveryStage::Verifying {
+                    return Err(RecoveryError::Conflict);
+                }
+                self.verification(&task, verification, now)?;
+                task.verification = Some(verification.clone());
+                let outcome = match (verification.healthy, verification.executor_stopped) {
+                    (Some(true), true) => RepairOutcome::Verified,
+                    (Some(false), true) => RepairOutcome::Failed,
+                    _ => RepairOutcome::Unknown,
+                };
+                effects.push(self.finish(&mut task, outcome, now)?);
+                self.save_task(task, now)?;
             }
-            _ => Err(RecoveryError::Invalid(
-                "incident authority returned a stale revision".into(),
-            )),
+            RecoveryEvent::VerificationUnavailable {
+                task_id,
+                revision,
+                reason,
+            } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage != RecoveryStage::Verifying {
+                    return Err(RecoveryError::Conflict);
+                }
+                text(reason, 8192)?;
+                task.note = Some(reason.clone());
+                effects.push(self.finish(&mut task, RepairOutcome::Unknown, now)?);
+                self.save_task(task, now)?;
+            }
+            RecoveryEvent::ResultChecked {
+                task_id,
+                revision,
+                execution,
+                verification,
+                actor,
+                approval,
+            } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage != RecoveryStage::Unknown {
+                    return Err(RecoveryError::Conflict);
+                }
+                self.bind_approval(&task, approval)?;
+                self.verification(&task, verification, now)?;
+                text(actor, 128)?;
+                evidence(&execution.evidence_refs)?;
+                let op = task
+                    .operation
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing operation"))?;
+                if execution.operation_id != op.operation_id
+                    || execution.target_id != op.target
+                    || execution.executor_id != self.config.target.executor_id
+                    || (execution.checked_at_ms < task.updated_at_ms
+                        && !task
+                            .result_check
+                            .as_ref()
+                            .is_some_and(|r| &r.execution == execution))
+                    || execution.checked_at_ms > now
+                    || now - execution.checked_at_ms > 30_000
+                    || execution.executor_stopped != verification.executor_stopped
+                    || (execution.outcome != CheckedExecution::Unknown
+                        && !execution.executor_stopped)
+                {
+                    return Err(invalid("invalid independent execution evidence"));
+                }
+                let known = task
+                    .result_check
+                    .as_ref()
+                    .map(|r| r.execution.outcome)
+                    .filter(|v| *v != CheckedExecution::Unknown)
+                    .or_else(|| {
+                        task.receipt.as_ref().and_then(|r| match r.outcome {
+                            ScriptOutcome::Executed => Some(CheckedExecution::Executed),
+                            ScriptOutcome::Failed => Some(CheckedExecution::Failed),
+                            ScriptOutcome::Unknown => None,
+                        })
+                    });
+                if known.is_some_and(|old| old != execution.outcome) {
+                    return Err(invalid("cannot overwrite confirmed execution facts"));
+                }
+                let allowed = match approval.state {
+                    ApprovalState::Unknown => true,
+                    ApprovalState::Executed => execution.outcome == CheckedExecution::Executed,
+                    ApprovalState::Failed => {
+                        execution.outcome == CheckedExecution::Failed
+                            || (execution.outcome == CheckedExecution::NotExecuted
+                                && task.result_check.as_ref().is_some_and(|r| {
+                                    r.execution.outcome == CheckedExecution::NotExecuted
+                                }))
+                    }
+                    _ => false,
+                };
+                if !allowed {
+                    return Err(invalid("result check conflicts with approval"));
+                }
+                // The prepared event carries evidence. Host must reconcile the
+                // approval first or in the same atomic transaction before release.
+
+                task.result_check = Some(ResultCheckRecord {
+                    execution: execution.clone(),
+                    actor: actor.clone(),
+                });
+                task.verification = Some(verification.clone());
+                if approval.state == ApprovalState::Unknown {
+                    self.save_task(task, now)?;
+                    return Ok(effects);
+                }
+                match execution.outcome {
+                    CheckedExecution::Unknown => {}
+                    CheckedExecution::NotExecuted => {
+                        task.stage = RecoveryStage::Canceled;
+                    }
+                    CheckedExecution::Executed | CheckedExecution::Failed => {
+                        task.receipt = Some(ScriptReceipt {
+                            operation_id: op.operation_id.clone(),
+                            target_id: op.target.clone(),
+                            outcome: if execution.outcome == CheckedExecution::Executed {
+                                ScriptOutcome::Executed
+                            } else {
+                                ScriptOutcome::Failed
+                            },
+                            executor_stopped: true,
+                            evidence_refs: execution.evidence_refs.clone(),
+                            summary: "independent execution result check".into(),
+                        });
+                        if execution.outcome == CheckedExecution::Failed {
+                            effects.push(self.finish(&mut task, RepairOutcome::Failed, now)?);
+                        } else if let Some(healthy) = verification.healthy {
+                            effects.push(self.finish(
+                                &mut task,
+                                if healthy {
+                                    RepairOutcome::Verified
+                                } else {
+                                    RepairOutcome::Failed
+                                },
+                                now,
+                            )?);
+                        }
+                    }
+                }
+                self.save_task(task, now)?;
+            }
+            RecoveryEvent::Resume { task_id, revision } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage != RecoveryStage::Paused {
+                    return Err(RecoveryError::Conflict);
+                }
+                task.stage = RecoveryStage::AwaitingApproval;
+                if task.approval_id.is_none() {
+                    effects.push(RecoveryEffect::RequestApproval {
+                        operation: task
+                            .operation
+                            .clone()
+                            .ok_or_else(|| invalid("missing original intent"))?,
+                        policy: self.policy(&task).clone(),
+                    });
+                }
+                self.save_task(task, now)?;
+            }
+            RecoveryEvent::Cancel {
+                task_id,
+                revision,
+                approval,
+            } => {
+                let mut task = self.current(task_id, *revision)?;
+                if task.stage.terminal()
+                    || matches!(
+                        task.stage,
+                        RecoveryStage::Executing
+                            | RecoveryStage::Unknown
+                            | RecoveryStage::Verifying
+                    )
+                {
+                    return Err(invalid(
+                        "dispatched work requires independent result evidence",
+                    ));
+                }
+                if task.approval_id.is_some() {
+                    let record = approval
+                        .as_ref()
+                        .ok_or_else(|| invalid("cancel linked approval first"))?;
+                    self.bind_approval(&task, record)?;
+                    if !matches!(
+                        record.state,
+                        ApprovalState::Canceled
+                            | ApprovalState::Denied
+                            | ApprovalState::Expired
+                            | ApprovalState::Revoked
+                    ) {
+                        return Err(invalid("approval still grants authority"));
+                    }
+                } else if task.operation.is_some() {
+                    return Err(invalid(
+                        "resolve pending approval association before cancellation",
+                    ));
+                }
+                task.stage = RecoveryStage::Canceled;
+                task.diagnosis_call = None;
+                self.save_task(task, now)?;
+            }
+            RecoveryEvent::Recover => {
+                self.recovery_required = false;
+                let tasks: Vec<_> = self.tasks.values().cloned().collect();
+                for mut task in tasks {
+                    match task.stage {
+                        RecoveryStage::Executing => {
+                            let op = task
+                                .operation
+                                .as_ref()
+                                .ok_or_else(|| invalid("missing execution intent"))?;
+                            task.receipt = Some(ScriptReceipt {
+                                operation_id: op.operation_id.clone(),
+                                target_id: op.target.clone(),
+                                outcome: ScriptOutcome::Unknown,
+                                executor_stopped: false,
+                                evidence_refs: vec![format!(
+                                    "approval:{}",
+                                    task.approval_id.as_deref().unwrap_or("unknown")
+                                )],
+                                summary: "interrupted execution; independent evidence required"
+                                    .into(),
+                            });
+                            effects.push(self.finish(&mut task, RepairOutcome::Unknown, now)?);
+                            task.note =
+                                Some("interrupted execution; explicit evidence required".into());
+                        }
+                        RecoveryStage::AwaitingApproval => {
+                            task.stage = RecoveryStage::Paused;
+                        }
+                        RecoveryStage::Diagnosing if task.diagnosis_call.is_some() => {
+                            task.diagnosis_call = None;
+                            task.note =
+                                Some("interrupted diagnosis remains charged to budget".into());
+                        }
+                        _ => continue,
+                    }
+                    self.save_task(task, now)?;
+                }
+            }
+            RecoveryEvent::DeliveryConfirmed { delivery_id } => {
+                let current = self
+                    .deliveries
+                    .get(delivery_id)
+                    .ok_or_else(|| invalid("delivery not found"))?;
+                if !current.delivered
+                    && self.deliveries.values().any(|older| {
+                        !older.delivered
+                            && older.candidate.id == current.candidate.id
+                            && older.created_revision < current.created_revision
+                    })
+                {
+                    return Err(invalid("earlier knowledge outcome must be delivered first"));
+                }
+                let delivery = self
+                    .deliveries
+                    .get_mut(delivery_id)
+                    .ok_or_else(|| invalid("delivery not found"))?;
+                delivery.delivered = true;
+            }
         }
+        Ok(effects)
     }
-    fn validate_verification(
+
+    fn verification(
         &self,
         task: &RecoveryTask,
         v: &BusinessVerification,
+        now: u64,
     ) -> Result<(), RecoveryError> {
         evidence(&v.evidence_refs)?;
         let op = task
             .operation
             .as_ref()
-            .ok_or_else(|| service("missing operation"))?;
+            .ok_or_else(|| invalid("missing operation"))?;
         if v.operation_id != op.operation_id
             || v.target_id != op.target
             || v.profile != self.config.target.verification_profile
-            || v.verified_at_ms < task.updated_at_ms
-            || v.verified_at_ms > self.clock.now_ms()
-            || self.clock.now_ms().saturating_sub(v.verified_at_ms) > 30_000
+            || (v.verified_at_ms < task.updated_at_ms && task.verification.as_ref() != Some(v))
+            || v.verified_at_ms > now
+            || now - v.verified_at_ms > 30_000
         {
-            return Err(RecoveryError::Invalid(
-                "verification identity, profile or freshness mismatch".into(),
+            return Err(invalid(
+                "verification identity, profile or freshness mismatch",
             ));
         }
         Ok(())
     }
-    fn publish(&self, mut task: RecoveryTask) -> Result<RecoveryTask, RecoveryError> {
-        let plan = task.plan.as_ref().ok_or_else(|| service("missing plan"))?;
+    fn reset_attempt(&self, task: &mut RecoveryTask) {
+        task.plan = None;
+        task.operation = None;
+        task.approval_id = None;
+        task.knowledge_id = None;
+        task.reused_script = false;
+        task.receipt = None;
+        task.verification = None;
+        task.result_check = None;
+        task.diagnosis_call = None;
+    }
+    fn finish(
+        &mut self,
+        task: &mut RecoveryTask,
+        outcome: RepairOutcome,
+        now: u64,
+    ) -> Result<RecoveryEffect, RecoveryError> {
+        let plan = task.plan.as_ref().ok_or_else(|| invalid("missing plan"))?;
         let op = task
             .operation
             .as_ref()
-            .ok_or_else(|| service("missing operation"))?;
+            .ok_or_else(|| invalid("missing operation"))?;
         let receipt = task
             .receipt
             .as_ref()
-            .ok_or_else(|| service("missing receipt"))?;
-        let outcome = if receipt.outcome == ScriptOutcome::Unknown || !receipt.executor_stopped {
-            RepairOutcome::Unknown
-        } else if receipt.outcome == ScriptOutcome::Failed {
-            RepairOutcome::Failed
-        } else {
-            match task.verification.as_ref() {
-                Some(v) if v.executor_stopped && v.healthy == Some(true) => RepairOutcome::Verified,
-                Some(v) if v.executor_stopped && v.healthy == Some(false) => RepairOutcome::Failed,
-                _ => RepairOutcome::Unknown,
-            }
+            .ok_or_else(|| invalid("missing execution receipt"))?;
+        let id = task
+            .knowledge_id
+            .clone()
+            .unwrap_or_else(|| format!("case-{}-{}", task.id, task.diagnosis_attempts));
+        let candidate = match self.candidates.get(&id) {
+            Some(candidate) => candidate.clone(),
+            None => KnowledgeCandidate {
+                id: id.clone(),
+                incident_id: task.problem.incident_id.clone(),
+                summary: plan.summary.clone(),
+                keywords: task.problem.keywords.clone(),
+                conditions: self.conditions(
+                    task,
+                    task.observation
+                        .as_ref()
+                        .ok_or_else(|| invalid("missing observation"))?,
+                )?,
+                script: plan.script.clone(),
+                reusable: plan.reusable
+                    && task.episode_count >= self.config.minimum_script_occurrences,
+                evidence_refs: task.problem.evidence_refs.clone(),
+                created_at_ms: task.created_at_ms,
+            },
         };
-        let reusable =
-            plan.reusable && task.episode_count >= self.config.minimum_script_occurrences;
-        {
-            let id = task
-                .knowledge_id
-                .clone()
-                .unwrap_or_else(|| format!("case-{}-{}", task.id, task.diagnosis_attempts));
-            let mut refs = receipt.evidence_refs.clone();
-            if let Some(v) = &task.verification {
-                refs = v.evidence_refs.clone();
-            }
-            let timestamp = task.updated_at_ms;
-            let case = RepairCase {
-                id: format!("{}-{outcome:?}", op.operation_id),
+        let refs = task.verification.as_ref().map_or_else(
+            || receipt.evidence_refs.clone(),
+            |v| v.evidence_refs.clone(),
+        );
+        let verification = if outcome == RepairOutcome::Verified {
+            let v = task
+                .verification
+                .as_ref()
+                .ok_or_else(|| invalid("missing verified evidence"))?;
+            Some(BusinessVerificationRecord {
                 operation_id: op.operation_id.clone(),
                 target_id: op.target.clone(),
                 script_id: plan.script.id.clone(),
                 script_version: plan.script.version,
-                outcome,
+                verifier_id: format!("{}:{}", self.config.target.executor_id, v.profile),
                 evidence_refs: refs.clone(),
-                recorded_at_ms: timestamp,
-            };
-            let proof = if outcome == RepairOutcome::Verified {
-                let v = task
-                    .verification
-                    .as_ref()
-                    .ok_or_else(|| service("missing verification"))?;
-                Some(
-                    TrustedBusinessVerification::attest(
-                        &op.operation_id,
-                        &op.target,
-                        &plan.script.id,
-                        plan.script.version,
-                        format!("{}:{}", self.config.target.executor_id, v.profile),
-                        refs,
-                        v.verified_at_ms,
-                    )
-                    .map_err(service)?,
-                )
-            } else {
-                None
-            };
-            let conditions = self.conditions(
-                &task,
-                task.observation
-                    .as_ref()
-                    .ok_or_else(|| service("missing environment"))?,
-            )?;
-            self.state(|s| {
-                if task.knowledge_id.is_none() {
-                    s.knowledge
-                        .upsert_candidate(KnowledgeCandidate {
-                            id: id.clone(),
-                            incident_id: task.problem.incident_id.clone(),
-                            summary: plan.summary.clone(),
-                            keywords: task.problem.keywords.clone(),
-                            conditions,
-                            script: plan.script.clone(),
-                            reusable,
-                            evidence_refs: task.problem.evidence_refs.clone(),
-                            created_at_ms: task.created_at_ms,
-                        })
-                        .map_err(service)?;
-                }
-                s.knowledge
-                    .record_outcome(&id, case, proof)
-                    .map_err(service)?;
-                Ok(())
-            })?;
-            task.knowledge_id = Some(id);
-        }
-        match outcome {
-            RepairOutcome::Verified => task.stage = RecoveryStage::Completed,
-            RepairOutcome::Unknown => task.stage = RecoveryStage::Unknown,
-            RepairOutcome::Failed
-                if task.reused_script && task.diagnosis_attempts < self.config.max_diagnoses =>
-            {
-                // Failure is terminal for this approved script. A NEW diagnosis creates a NEW approval.
-                task.note = Some(format!(
-                    "reused script failed; executor stopped. Receipt: {}. Verification: {:?}",
-                    receipt.summary, task.verification
-                ));
-                task.reused_script = false;
-                task.knowledge_id = None;
-                task.approval_id = None;
-                task.operation = None;
-                task.result_check = None;
-                task.stage = RecoveryStage::Diagnosing;
-            }
-            RepairOutcome::Failed => task.stage = RecoveryStage::Failed,
-        }
-        self.save(task)
-    }
-    /// Check operation status separately from current business health.
-    /// The trusted caller must obtain execution evidence from the bound executor;
-    /// health alone cannot prove execution or renew the consumed permit.
-    pub fn check_result(
-        &self,
-        id: &str,
-        revision: u64,
-        execution: ExecutionResultCheck,
-        verification: BusinessVerification,
-        actor: String,
-    ) -> Result<RecoveryTask, RecoveryError> {
-        self.check_ownership()?;
-        text(&actor, 128)?;
-        let _active = self.claim(id)?;
-        let mut task = self.task(id)?;
-        if task.revision != revision || task.stage != RecoveryStage::Unknown {
-            return Err(RecoveryError::Busy);
-        }
-        self.validate_result_check(&task, &execution)?;
-        self.validate_verification(&task, &verification)?;
-        if verification.executor_stopped != execution.executor_stopped {
-            return Err(RecoveryError::Invalid(
-                "execution and business evidence disagree about executor termination".into(),
-            ));
-        }
-        let op = task
-            .operation
-            .as_ref()
-            .ok_or_else(|| service("missing operation"))?
-            .clone();
-        let request_id = task
-            .approval_id
-            .as_ref()
-            .ok_or_else(|| service("missing approval"))?
-            .clone();
-        let authority = self.state(|s| {
-            s.approvals
-                .get(&request_id)
-                .map(|record| record.state)
-                .ok_or_else(|| service("missing approval"))
-        })?;
-        if !matches!(
-            authority,
-            ApprovalState::Unknown | ApprovalState::Executed | ApprovalState::Failed
-        ) || (authority == ApprovalState::Executed
-            && execution.outcome != CheckedExecution::Executed)
-            || (authority == ApprovalState::Failed
-                && execution.outcome != CheckedExecution::Failed
-                && !(execution.outcome == CheckedExecution::NotExecuted
-                    && task.result_check.as_ref().is_some_and(|record| {
-                        record.execution.outcome == CheckedExecution::NotExecuted
-                    })))
-        {
-            return Err(RecoveryError::Invalid(
-                "execution result check conflicts with durable approval outcome".into(),
-            ));
-        }
-        // Persist the independent facts before finalizing authority. An interrupted
-        // commit remains Unknown with its evidence available for explicit recovery.
-        task.result_check = Some(ResultCheckRecord {
-            execution: execution.clone(),
-            actor: actor.clone(),
-        });
-        task.verification = Some(verification);
-        task = self.save(task)?;
-        if execution.outcome == CheckedExecution::Unknown {
-            return Ok(task);
-        }
-        let outcome = if execution.outcome == CheckedExecution::Executed {
-            ExecutionOutcome::Executed
+                verified_at_ms: v.verified_at_ms,
+            })
         } else {
-            ExecutionOutcome::Failed
+            None
         };
-        self.state(|s| {
-            if s.approvals
-                .get(&request_id)
-                .is_some_and(|r| r.state == ApprovalState::Unknown)
-            {
-                s.approvals.reconcile_unknown(
-                    &request_id,
-                    outcome,
-                    if execution.outcome == CheckedExecution::NotExecuted {
-                        "executor confirmed operation was not executed".into()
-                    } else {
-                        format!("independent executor evidence: {:?}", execution.outcome)
-                    },
-                    actor,
-                    self.clock.now_ms() / 1000,
-                )?;
-            }
-            Ok(())
-        })?;
-        if execution.outcome == CheckedExecution::Executed
-            && task
-                .verification
-                .as_ref()
-                .is_some_and(|verification| verification.healthy.is_none())
-        {
-            // Execution is known, but recovery is not. Keep the prepared evidence
-            // available for another result_check without republishing Unknown.
-            return Ok(task);
-        }
-        if execution.outcome == CheckedExecution::NotExecuted {
-            task.stage = RecoveryStage::Canceled;
-            task.note = Some(
-                "executor confirmed operation was not executed; old permit remains consumed".into(),
-            );
-            return self.save(task);
-        }
-        task.receipt = Some(ScriptReceipt {
+        let case = RepairCase {
+            id: format!("{}-{outcome:?}", op.operation_id),
             operation_id: op.operation_id.clone(),
             target_id: op.target.clone(),
-            outcome: if execution.outcome == CheckedExecution::Executed {
-                ScriptOutcome::Executed
-            } else {
-                ScriptOutcome::Failed
-            },
-            executor_stopped: true,
-            evidence_refs: execution.evidence_refs,
-            summary: "independent execution result check".into(),
-        });
-        task.stage = RecoveryStage::Publishing;
-        self.save(task)
-    }
-
-    fn validate_result_check(
-        &self,
-        task: &RecoveryTask,
-        execution: &ExecutionResultCheck,
-    ) -> Result<(), RecoveryError> {
-        evidence(&execution.evidence_refs)?;
-        let operation = task
-            .operation
-            .as_ref()
-            .ok_or_else(|| service("missing operation"))?;
-        let now = self.clock.now_ms();
-        if execution.operation_id != operation.operation_id
-            || execution.target_id != operation.target
-            || execution.executor_id != self.config.target.executor_id
-            || execution.checked_at_ms < task.updated_at_ms
-            || execution.checked_at_ms > now
-            || now.saturating_sub(execution.checked_at_ms) > 30_000
-            || (execution.outcome != CheckedExecution::Unknown && !execution.executor_stopped)
-            || task.receipt.as_ref().is_some_and(|receipt| {
-                receipt.executor_stopped
-                    && match receipt.outcome {
-                        ScriptOutcome::Executed => execution.outcome != CheckedExecution::Executed,
-                        ScriptOutcome::Failed => execution.outcome != CheckedExecution::Failed,
-                        ScriptOutcome::Unknown => false,
-                    }
-            })
-            || task.result_check.as_ref().is_some_and(|previous| {
-                previous.execution.outcome != CheckedExecution::Unknown
-                    && previous.execution.outcome != execution.outcome
-            })
+            script_id: plan.script.id.clone(),
+            script_version: plan.script.version,
+            outcome,
+            evidence_refs: refs,
+            recorded_at_ms: now,
+        };
+        let delivery = KnowledgeDelivery {
+            id: case.id.clone(),
+            created_revision: self
+                .revision
+                .checked_add(1)
+                .ok_or(RecoveryError::Capacity)?,
+            candidate: candidate.clone(),
+            case,
+            verification,
+            delivered: false,
+        };
+        if self.deliveries.contains_key(&delivery.id) {
+            return Err(invalid("result delivery already exists"));
+        }
+        self.candidates.insert(id.clone(), candidate);
+        self.deliveries
+            .insert(delivery.id.clone(), delivery.clone());
+        if outcome != RepairOutcome::Verified {
+            self.quarantined
+                .insert((plan.script.id.clone(), plan.script.version));
+        }
+        task.knowledge_id = Some(id);
+        task.stage = match outcome {
+            RepairOutcome::Verified => RecoveryStage::Completed,
+            RepairOutcome::Unknown => RecoveryStage::Unknown,
+            RepairOutcome::Failed => RecoveryStage::Failed,
+        };
+        if outcome == RepairOutcome::Failed
+            && task.reused_script
+            && task.diagnosis_attempts < self.config.max_diagnoses
         {
-            return Err(RecoveryError::Invalid(
-                "execution result check identity, freshness, termination or outcome mismatch"
-                    .into(),
-            ));
+            self.reset_attempt(task);
+            task.stage = RecoveryStage::Diagnosing;
+            task.note = Some("reused script failed; fresh diagnosis and approval required".into());
         }
-        Ok(())
-    }
-}
-
-struct Active<'a> {
-    active: &'a Mutex<BTreeSet<String>>,
-    id: String,
-}
-impl Drop for Active<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut active) = self.active.lock() {
-            active.remove(&self.id);
-        }
-    }
-}
-impl Drop for RecoveryService {
-    fn drop(&mut self) {
-        let _ = self.calls.close();
+        let earliest = self
+            .pending_deliveries()
+            .into_iter()
+            .find(|item| item.candidate.id == delivery.candidate.id)
+            .ok_or_else(|| invalid("missing pending delivery"))?;
+        Ok(RecoveryEffect::DeliverKnowledge(Box::new(earliest)))
     }
 }

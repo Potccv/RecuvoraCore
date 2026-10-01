@@ -2,15 +2,15 @@
 use super::validation::{bounded_object, bounded_text};
 use super::*;
 
-impl IncidentStore {
-    pub(super) fn prepare(
+impl IncidentLedger {
+    pub(super) fn compute(
         &self,
-        event: &Event,
+        event: &IncidentEvent,
         sequence: u64,
-    ) -> Result<Option<Prepared>, IncidentError> {
+    ) -> Result<Option<Transition>, IncidentError> {
         match event {
-            Event::Monitor { commit } => self.prepare_monitor(commit, sequence),
-            Event::Acknowledge {
+            IncidentEvent::Monitor { commit } => self.compute_monitor(commit, sequence),
+            IncidentEvent::Acknowledge {
                 id,
                 expected_revision,
                 actor,
@@ -37,7 +37,7 @@ impl IncidentStore {
                     note: note.clone(),
                     at_ms: (*now_ms).max(record.last_seen),
                 });
-                Ok(Some(Prepared {
+                Ok(Some(Transition {
                     records: vec![record],
                     monitor: None,
                 }))
@@ -45,11 +45,11 @@ impl IncidentStore {
         }
     }
 
-    fn prepare_monitor(
+    fn compute_monitor(
         &self,
         commit: &MonitorCommit,
         sequence: u64,
-    ) -> Result<Option<Prepared>, IncidentError> {
+    ) -> Result<Option<Transition>, IncidentError> {
         bounded_text(&commit.monitor_id, 256, "monitor id", false)?;
         bounded_object(&commit.checkpoint, MAX_CHECKPOINT_BYTES, "checkpoint")?;
         if commit.signals.len() > 128 {
@@ -155,7 +155,7 @@ impl IncidentStore {
         if self.records.len().saturating_add(additions) > self.config.max_incidents {
             return Err(IncidentError::Capacity("incident episodes".into()));
         }
-        Ok(Some(Prepared {
+        Ok(Some(Transition {
             records,
             monitor: Some(MonitorState {
                 commit: commit.clone(),
@@ -164,7 +164,7 @@ impl IncidentStore {
         }))
     }
 
-    pub(super) fn install(&mut self, prepared: Prepared) {
+    pub(super) fn install(&mut self, prepared: Transition) {
         for record in prepared.records {
             let key = (
                 record.monitor_id.clone(),

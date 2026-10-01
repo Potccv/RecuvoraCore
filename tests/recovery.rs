@@ -1,1507 +1,1103 @@
-use recuvora_core::{
-    operation::Cancellation,
-    recovery::{
-        approval::{
-            ApprovalDecision, ApprovalPolicy, ApprovalState, ModelAssessment, ReviewerConfig,
-            ReviewerIdentity,
-        },
-        knowledge::{
-            KnowledgeCandidate, KnowledgeQuery, KnowledgeStatus, KnowledgeStore,
-            KnowledgeStoreConfig, RepairOutcome, ScriptArtifact,
-        },
-        workflow::*,
-    },
-};
-use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use recuvora_core::operation::{CommitReceipt, Prepared};
+use recuvora_core::recovery::{approval::*, knowledge::*, workflow::*};
+use std::collections::BTreeMap;
 
-#[path = "workflow_support.rs"]
-mod support;
-use support::TestDir;
-
-#[path = "recovery_approval.rs"]
-mod approval_recovery_tests;
-
-#[path = "recovery_guards.rs"]
-mod guard_tests;
-
-#[path = "recovery_shutdown.rs"]
-mod shutdown_tests;
-
-#[path = "recovery_naming.rs"]
-mod naming_tests;
-
-struct Clock(AtomicU64);
-impl Clock {
-    fn new() -> Self {
-        Self(AtomicU64::new(1_000_000))
-    }
-    fn advance(&self, millis: u64) {
-        self.0.fetch_add(millis, Ordering::SeqCst);
-    }
+fn commit<S, E>(pending: Prepared<S, E>) -> (S, Vec<E>) {
+    let receipt = CommitReceipt::confirmed(pending.request());
+    let committed = pending.confirm(receipt).unwrap();
+    (committed.state, committed.effects)
 }
-impl RecoveryClock for Clock {
-    fn now_ms(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
-    }
-}
-
-struct FakeState {
-    calls: Vec<String>,
-    facts: BTreeMap<String, String>,
-    outcomes: VecDeque<(ScriptOutcome, bool)>,
-    verifications: VecDeque<Option<bool>>,
-    review_error: bool,
-    wrong_reviewer: bool,
-    diagnoses: u64,
-    review_timeouts: Vec<u64>,
-    knowledge_seen: Vec<usize>,
-}
-struct Backend {
-    clock: Arc<Clock>,
-    state: Mutex<FakeState>,
-    execution_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
-    execution_entered: tokio::sync::Notify,
-    cancellation_seen: tokio::sync::Notify,
-}
-
-impl Backend {
-    fn new(clock: Arc<Clock>) -> Self {
-        Self {
-            clock,
-            execution_gate: Mutex::new(None),
-            execution_entered: tokio::sync::Notify::new(),
-            cancellation_seen: tokio::sync::Notify::new(),
-            state: Mutex::new(FakeState {
-                calls: vec![],
-                facts: facts(),
-                outcomes: VecDeque::new(),
-                verifications: VecDeque::new(),
-                review_error: false,
-                wrong_reviewer: false,
-                diagnoses: 0,
-                review_timeouts: vec![],
-                knowledge_seen: vec![],
-            }),
-        }
-    }
-    fn count(&self, method: &str) -> usize {
-        self.state
-            .lock()
-            .unwrap()
-            .calls
-            .iter()
-            .filter(|call| call.as_str() == method)
-            .count()
-    }
-}
-
-impl RepairBackend for Backend {
-    fn inspect<'a>(
-        &'a self,
-        target: &'a TargetBinding,
-        _: Cancellation,
-    ) -> RecoveryFuture<'a, TargetObservation> {
-        Box::pin(async move {
-            let mut state = self.state.lock().unwrap();
-            state.calls.push("inspect".into());
-            Ok(TargetObservation {
-                target_id: target.target_id.clone(),
-                facts: state.facts.clone(),
-                evidence_refs: vec!["provider-observation:inspect".into()],
-                observed_at_ms: self.clock.now_ms(),
-            })
-        })
-    }
-    fn diagnose(&self, input: DiagnosisInput, _: Cancellation) -> RecoveryFuture<'_, RepairPlan> {
-        Box::pin(async move {
-            let mut state = self.state.lock().unwrap();
-            state.calls.push("diagnose".into());
-            state.diagnoses += 1;
-            state.knowledge_seen.push(input.knowledge.len());
-            for candidate in &input.knowledge {
-                if candidate.id == "external-case" {
-                    assert!(
-                        !candidate.reusable,
-                        "external knowledge cannot attest reuse"
-                    );
-                    assert!(
-                        candidate
-                            .evidence_refs
-                            .iter()
-                            .any(|reference| reference == "knowledge-source:external-source")
-                    );
-                }
-            }
-            Ok(RepairPlan {
-                summary: "restore the workload under exact preconditions".into(),
-                reusable: true,
-                script: ScriptArtifact {
-                    id: "workload-repair".into(),
-                    version: state.diagnoses,
-                    language: "sh".into(),
-                    platform: input.config.target.platform,
-                    source: "exit 0".into(),
-                    preconditions: input.observation.facts,
-                    generated_by_harness: input.config.execution_harness,
-                    generated_in_session: format!("execution-session-{}", state.diagnoses),
-                },
-            })
-        })
-    }
-    fn review(&self, input: ReviewInput, _: Cancellation) -> RecoveryFuture<'_, ReviewOutput> {
-        Box::pin(async move {
-            let mut state = self.state.lock().unwrap();
-            state.calls.push("review".into());
-            state.review_timeouts.push(
-                input
-                    .attempt
-                    .deadline
-                    .saturating_sub(self.clock.now_ms() / 1000),
-            );
-            if state.review_error {
-                return Err(RecoveryError::Service("review service unavailable".into()));
-            }
-            Ok(ReviewOutput {
-                assessment: ModelAssessment {
-                    request_id: input.request.request_id,
-                    decision: ApprovalDecision::Approve,
-                    reason: "exact script and current target were reviewed".into(),
-                },
-                identity: ReviewerIdentity {
-                    harness_id: if state.wrong_reviewer {
-                        "unconfigured-reviewer".into()
-                    } else {
-                        input.attempt.harness_id
-                    },
-                    session_id: format!("review-session-{}", state.calls.len()),
-                },
-            })
-        })
-    }
-    fn execute<'a>(
-        &'a self,
-        script: AuthorizedScript<'a>,
-        cancellation: Cancellation,
-    ) -> RecoveryFuture<'a, ScriptReceipt> {
-        Box::pin(async move {
-            let (mut outcome, mut executor_stopped) = {
-                let mut state = self.state.lock().unwrap();
-                state.calls.push("execute".into());
-                state
-                    .outcomes
-                    .pop_front()
-                    .unwrap_or((ScriptOutcome::Executed, true))
-            };
-            let gate = self.execution_gate.lock().unwrap().take();
-            if let Some(gate) = gate {
-                self.execution_entered.notify_one();
-                cancellation.cancelled().await;
-                self.cancellation_seen.notify_one();
-                gate.notified().await;
-                outcome = ScriptOutcome::Unknown;
-                executor_stopped = false;
-            }
-            let operation = script.operation();
-            assert_eq!(operation.action["kind"], "execute_script");
-            assert!(!script.request_id().is_empty());
-            Ok(ScriptReceipt {
-                operation_id: operation.operation_id.clone(),
-                target_id: operation.target.clone(),
-                outcome,
-                executor_stopped,
-                evidence_refs: vec!["external-action:receipt".into()],
-                summary: "bounded provider action result".into(),
-            })
-        })
-    }
-    fn verify(
-        &self,
-        input: VerificationInput,
-        _: Cancellation,
-    ) -> RecoveryFuture<'_, BusinessVerification> {
-        Box::pin(async move {
-            let mut state = self.state.lock().unwrap();
-            state.calls.push("verify".into());
-            let healthy = state.verifications.pop_front().unwrap_or(Some(true));
-            Ok(BusinessVerification {
-                operation_id: input.operation.operation_id,
-                target_id: input.target.target_id,
-                profile: input.target.verification_profile,
-                healthy,
-                executor_stopped: true,
-                evidence_refs: vec!["provider-observation:business-check".into()],
-                verified_at_ms: self.clock.now_ms(),
-            })
-        })
-    }
-}
-
-impl IncidentGuard for Backend {
-    fn with_current(
-        &self,
-        problem: &ProblemContext,
-        commit: &mut dyn FnMut(IncidentReadiness) -> Result<(), RecoveryError>,
-    ) -> Result<(), RecoveryError> {
-        commit(IncidentReadiness::Active {
-            revision: problem.incident_revision,
-        })
-    }
-}
-
-fn open(
-    dir: &std::path::Path,
-    config: RecoveryConfig,
-    backend: Arc<Backend>,
-    clock: Arc<Clock>,
-) -> Result<Arc<RecoveryService>, RecoveryError> {
-    let recovery = RecoveryService::open_with_clock(dir, config, backend.clone(), clock)?;
-    recovery.bind_target_ownership(Arc::new(FileTargetOwnership::open(dir.join("ownership"))?))?;
-    recovery.bind_incident_guard(backend)?;
-    Ok(recovery)
-}
-
-fn facts() -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("runtime_version".into(), "1".into()),
-        ("fault".into(), "not-ready".into()),
-    ])
-}
-
-fn policy(id: &str, reviewer: ReviewerConfig) -> ApprovalPolicy {
+fn policy() -> ApprovalPolicy {
     ApprovalPolicy {
-        id: id.into(),
+        id: "policy".into(),
         version: 1,
-        reviewer,
-        delegation: "review exact bounded workload repair".into(),
-        allowed_targets: vec!["target-a".into()],
+        reviewer: ReviewerConfig::Harness {
+            harness_id: "reviewer".into(),
+        },
+        delegation: "bounded repair".into(),
+        allowed_targets: vec!["target".into()],
         allowed_action_kinds: vec!["execute_script".into()],
         ttl_secs: 600,
     }
 }
-
 fn config() -> RecoveryConfig {
     RecoveryConfig {
         schema_version: 1,
-        execution_harness: "executor".into(),
+        execution_harness: "diagnoser".into(),
         target: TargetBinding {
-            target_id: "target-a".into(),
-            executor_id: "target-node".into(),
+            target_id: "target".into(),
+            executor_id: "executor".into(),
             platform: "linux".into(),
             allowed_languages: vec!["sh".into()],
-            diagnostic_queries: vec!["observe".into()],
-            verification_profile: "workload-ready".into(),
-            required_facts: BTreeMap::from([("runtime_version".into(), "1".into())]),
+            diagnostic_queries: vec!["status".into()],
+            verification_profile: "business".into(),
+            required_facts: facts(),
             action_timeout_secs: 30,
         },
-        approval: policy(
-            "fresh-repair",
-            ReviewerConfig::Harness {
-                harness_id: "reviewer".into(),
-            },
-        ),
-        script_approval: policy(
-            "reuse-repair",
-            ReviewerConfig::Harness {
-                harness_id: "reviewer".into(),
-            },
-        ),
+        approval: policy(),
+        script_approval: policy(),
         diagnosis_timeout_secs: 30,
-        review_timeout_secs: 30,
-        max_tool_calls: 8,
-        max_diagnoses: 3,
+        review_timeout_secs: 20,
+        max_tool_calls: 4,
+        max_diagnoses: 2,
         minimum_script_occurrences: 1,
-        max_tasks: 32,
-        max_journal_bytes: 1024 * 1024,
+        max_tasks: 100,
     }
 }
-
+fn facts() -> BTreeMap<String, String> {
+    BTreeMap::from([("environment".into(), "test".into())])
+}
 fn problem(id: &str) -> ProblemContext {
     ProblemContext {
         incident_id: id.into(),
         incident_revision: 1,
-        target_id: "target-a".into(),
-        fingerprint: "readiness-rule".into(),
-        summary: "workload has explicit unhealthy observations".into(),
-        occurrences: 2,
-        keywords: vec!["readiness".into()],
+        target_id: "target".into(),
+        fingerprint: "fault".into(),
+        summary: "unhealthy workload".into(),
+        occurrences: 100,
+        keywords: vec!["workload".into()],
         conditions: facts(),
-        evidence_refs: vec!["provider-observation:incident".into()],
+        evidence_refs: vec!["observation:1".into()],
     }
 }
-
-async fn drive(recovery: &Arc<RecoveryService>, id: &str) -> RecoveryTask {
-    for _ in 0..16 {
-        let task = recovery.advance(id, Cancellation::new()).await.unwrap();
-        if task.stage.terminal() || task.stage == RecoveryStage::Unknown {
-            return task;
+fn observation() -> TargetObservation {
+    TargetObservation {
+        target_id: "target".into(),
+        facts: facts(),
+        evidence_refs: vec!["observation:current".into()],
+        observed_at_ms: 100_000,
+    }
+}
+fn plan(version: u64) -> RepairPlan {
+    RepairPlan {
+        summary: "repair workload".into(),
+        reusable: true,
+        script: ScriptArtifact {
+            id: "script".into(),
+            version,
+            language: "sh".into(),
+            platform: "linux".into(),
+            source: "external action".into(),
+            preconditions: facts(),
+            generated_by_harness: "diagnoser".into(),
+            generated_in_session: "diagnosis-session".into(),
+        },
+    }
+}
+struct Flow {
+    state: RecoveryState,
+    knowledge: KnowledgeState,
+    approvals: ApprovalLedger,
+    id: String,
+}
+impl Flow {
+    fn new() -> Self {
+        Self {
+            state: RecoveryState::new(config()).unwrap(),
+            knowledge: KnowledgeState::new(KnowledgeConfig::default()).unwrap(),
+            approvals: ApprovalLedger::new(ApprovalLimits::default()).unwrap(),
+            id: String::new(),
         }
     }
-    panic!("bounded recovery did not reach a terminal state");
-}
-
-fn execution_evidence(
-    task: &RecoveryTask,
-    outcome: CheckedExecution,
-    clock: &Clock,
-) -> ExecutionResultCheck {
-    let operation = task.operation.as_ref().unwrap();
-    ExecutionResultCheck {
-        operation_id: operation.operation_id.clone(),
-        target_id: operation.target.clone(),
-        executor_id: "target-node".into(),
-        outcome,
-        executor_stopped: true,
-        evidence_refs: vec!["executor:durable-operation-status".into()],
-        checked_at_ms: clock.now_ms(),
+    fn task(&self) -> &RecoveryTask {
+        self.state.task(&self.id).unwrap()
     }
-}
-
-fn business_evidence(task: &RecoveryTask, clock: &Clock) -> BusinessVerification {
-    let operation = task.operation.as_ref().unwrap();
-    BusinessVerification {
-        operation_id: operation.operation_id.clone(),
-        target_id: operation.target.clone(),
-        profile: "workload-ready".into(),
-        healthy: Some(true),
-        executor_stopped: true,
-        evidence_refs: vec!["provider-observation:independent-health".into()],
-        verified_at_ms: clock.now_ms(),
-    }
-}
-
-fn remove_last_journal_entry(path: &std::path::Path) {
-    let mut bytes = std::fs::read(path).unwrap();
-    assert_eq!(bytes.pop(), Some(b'\n'));
-    let length = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    bytes.truncate(length);
-    std::fs::write(path, bytes).unwrap();
-}
-
-#[tokio::test]
-async fn healthy_target_cannot_promote_unknown_failed_or_unexecuted_operations() {
-    for (outcome, stage, authority) in [
-        (
-            CheckedExecution::Unknown,
-            RecoveryStage::Unknown,
-            ApprovalState::Unknown,
-        ),
-        (
-            CheckedExecution::Failed,
-            RecoveryStage::Failed,
-            ApprovalState::Failed,
-        ),
-        (
-            CheckedExecution::NotExecuted,
-            RecoveryStage::Canceled,
-            ApprovalState::Failed,
-        ),
-    ] {
-        let dir = TestDir::new("recovery-result_check-health");
-        let clock = Arc::new(Clock::new());
-        let backend = Arc::new(Backend::new(clock.clone()));
-        backend
+    fn step(&mut self, event: RecoveryEvent) -> Vec<RecoveryEffect> {
+        let pending = self
             .state
-            .lock()
+            .prepare(
+                format!("workflow-{}", self.state.revision()),
+                RecoveryCommand::Event(event),
+                100_000,
+                &self.knowledge,
+            )
+            .unwrap();
+        let (state, effects) = commit(pending);
+        self.state = state;
+        effects
+    }
+    fn register(&mut self, id: &str) {
+        self.step(RecoveryEvent::Register {
+            problem: problem(id),
+            incident: IncidentEvidence {
+                incident_id: id.into(),
+                revision: 1,
+                active: true,
+            },
+        });
+        self.id = self
+            .state
+            .tasks()
+            .find(|t| t.problem.incident_id == id)
             .unwrap()
-            .outcomes
-            .push_back((ScriptOutcome::Unknown, false));
-        let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-        let task = recovery
-            .submit(problem("incident-independent-execution"))
-            .unwrap();
-        let unknown = drive(&recovery, &task.id).await;
-        let knowledge_id = unknown.knowledge_id.clone().unwrap();
-        recovery
-            .check_result(
-                &task.id,
-                unknown.revision,
-                execution_evidence(&unknown, outcome, &clock),
-                business_evidence(&unknown, &clock),
-                "trusted-operator".into(),
-            )
-            .unwrap();
-        let result = drive(&recovery, &task.id).await;
-        assert_eq!(result.stage, stage);
-        assert_eq!(
-            recovery.approval(&task.id).unwrap().unwrap().state,
-            authority
-        );
-        assert_eq!(
-            result.result_check.as_ref().unwrap().execution.outcome,
-            outcome
-        );
-        assert_eq!(
-            result.result_check.as_ref().unwrap().actor,
-            "trusted-operator"
-        );
-        assert_eq!(backend.count("execute"), 1);
-        assert_eq!(backend.count("diagnose"), 1);
-        recovery.shutdown().await.unwrap();
-        drop(recovery);
-
-        let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-        let recovered = drive(&recovery, &task.id).await;
-        assert_eq!(recovered.stage, stage);
-        assert_eq!(
-            recovered.result_check.as_ref().unwrap().execution.outcome,
-            outcome
-        );
-        assert!(recovery.resume(&task.id, recovered.revision).is_err());
-        assert_eq!(backend.count("execute"), 1);
-        if outcome == CheckedExecution::Unknown {
-            assert!(matches!(
-                recovery.submit(problem("another-incident")),
-                Err(RecoveryError::Busy)
-            ));
-        }
-        recovery.shutdown().await.unwrap();
-        drop(recovery);
-        let knowledge = KnowledgeStore::open(
-            dir.path.join("knowledge.jsonl"),
-            KnowledgeStoreConfig::default(),
-        )
-        .unwrap();
-        let record = knowledge.get(&knowledge_id).unwrap();
-        assert!(
-            record
-                .cases
-                .iter()
-                .all(|case| case.result.outcome != RepairOutcome::Verified)
-        );
-        if outcome == CheckedExecution::NotExecuted {
-            assert_eq!(
-                record.cases.len(),
-                1,
-                "not executed must not invent a failure case"
-            );
-        }
+            .id
+            .clone();
     }
-}
-
-#[tokio::test]
-async fn execution_result_check_rejects_wrong_identity_stale_or_conflicting_evidence() {
-    let dir = TestDir::new("recovery-result_check-validation");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    backend
-        .state
-        .lock()
-        .unwrap()
-        .outcomes
-        .push_back((ScriptOutcome::Unknown, false));
-    let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-    let task = recovery
-        .submit(problem("incident-result_check-validation"))
-        .unwrap();
-    let unknown = drive(&recovery, &task.id).await;
-    let valid = execution_evidence(&unknown, CheckedExecution::Executed, &clock);
-    let mut invalid = Vec::new();
-    let mut wrong = valid.clone();
-    wrong.operation_id = "other-operation".into();
-    invalid.push(wrong);
-    let mut wrong = valid.clone();
-    wrong.target_id = "other-target".into();
-    invalid.push(wrong);
-    let mut wrong = valid.clone();
-    wrong.executor_id = "other-node".into();
-    invalid.push(wrong);
-    let mut wrong = valid.clone();
-    wrong.checked_at_ms -= 1;
-    invalid.push(wrong);
-    let mut wrong = valid.clone();
-    wrong.checked_at_ms += 1;
-    invalid.push(wrong);
-    let mut wrong = valid.clone();
-    wrong.evidence_refs.clear();
-    invalid.push(wrong);
-    let mut wrong = valid.clone();
-    wrong.executor_stopped = false;
-    invalid.push(wrong);
-    for execution in invalid {
-        assert!(
-            recovery
-                .check_result(
-                    &task.id,
-                    unknown.revision,
-                    execution,
-                    business_evidence(&unknown, &clock),
-                    "trusted-operator".into()
-                )
-                .is_err()
-        );
-        assert_eq!(
-            recovery.query(&task.id).unwrap().unwrap().revision,
-            unknown.revision
-        );
-    }
-    let mut health = business_evidence(&unknown, &clock);
-    health.executor_stopped = false;
-    assert!(
-        recovery
-            .check_result(
-                &task.id,
-                unknown.revision,
-                valid.clone(),
-                health,
-                "trusted-operator".into()
-            )
-            .is_err()
-    );
-    clock.advance(30_001);
-    assert!(
-        recovery
-            .check_result(
-                &task.id,
-                unknown.revision,
-                valid,
-                business_evidence(&unknown, &clock),
-                "trusted-operator".into()
-            )
-            .is_err()
-    );
-    assert_eq!(
-        recovery.approval(&task.id).unwrap().unwrap().state,
-        ApprovalState::Unknown
-    );
-    assert_eq!(backend.count("execute"), 1);
-    recovery.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn result_check_recovers_both_commit_boundaries_without_overwriting_execution_facts() {
-    for before_authority in [true, false] {
-        for outcome in [CheckedExecution::Failed, CheckedExecution::NotExecuted] {
-            let dir = TestDir::new("recovery-result_check-commit");
-            let clock = Arc::new(Clock::new());
-            let backend = Arc::new(Backend::new(clock.clone()));
-            backend
-                .state
-                .lock()
-                .unwrap()
-                .outcomes
-                .push_back((ScriptOutcome::Unknown, false));
-            let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-            let task = recovery
-                .submit(problem("incident-result_check-commit"))
-                .unwrap();
-            let unknown = drive(&recovery, &task.id).await;
-            recovery
-                .check_result(
-                    &task.id,
-                    unknown.revision,
-                    execution_evidence(&unknown, outcome, &clock),
-                    business_evidence(&unknown, &clock),
-                    "trusted-operator".into(),
-                )
-                .unwrap();
-            recovery.shutdown().await.unwrap();
-            drop(recovery);
-            // Emulate a stop after the prepared Unknown evidence but before the
-            // final task snapshot, with or without the authority commit.
-            remove_last_journal_entry(&dir.path.join("recovery.jsonl"));
-            if before_authority {
-                remove_last_journal_entry(&dir.path.join("approvals/approvals.jsonl"));
-            }
-            let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-            let recovered = recovery.query(&task.id).unwrap().unwrap();
-            assert_eq!(recovered.stage, RecoveryStage::Unknown);
-            assert_eq!(
-                recovered.result_check.as_ref().unwrap().execution.outcome,
-                outcome
-            );
-            assert!(
-                recovery
-                    .check_result(
-                        &task.id,
-                        recovered.revision,
-                        execution_evidence(&recovered, CheckedExecution::Executed, &clock),
-                        business_evidence(&recovered, &clock),
-                        "trusted-operator".into()
-                    )
-                    .is_err()
-            );
-            recovery
-                .check_result(
-                    &task.id,
-                    recovered.revision,
-                    execution_evidence(&recovered, outcome, &clock),
-                    business_evidence(&recovered, &clock),
-                    "trusted-operator".into(),
-                )
-                .unwrap();
-            let result = drive(&recovery, &task.id).await;
-            assert_eq!(
-                result.stage,
-                if outcome == CheckedExecution::NotExecuted {
-                    RecoveryStage::Canceled
-                } else {
-                    RecoveryStage::Failed
-                }
-            );
-            assert_eq!(backend.count("execute"), 1);
-            assert_eq!(backend.count("diagnose"), 1);
-            recovery.shutdown().await.unwrap();
-        }
-    }
-}
-
-#[tokio::test]
-async fn replay_rejects_changed_execution_result_check_identity_and_outcome() {
-    let dir = TestDir::new("recovery-result_check-replay");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    backend
-        .state
-        .lock()
-        .unwrap()
-        .outcomes
-        .push_back((ScriptOutcome::Unknown, false));
-    let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-    let task = recovery
-        .submit(problem("incident-result_check-replay"))
-        .unwrap();
-    let unknown = drive(&recovery, &task.id).await;
-    recovery
-        .check_result(
-            &task.id,
-            unknown.revision,
-            execution_evidence(&unknown, CheckedExecution::Executed, &clock),
-            business_evidence(&unknown, &clock),
-            "trusted-operator".into(),
-        )
-        .unwrap();
-    recovery.shutdown().await.unwrap();
-    drop(recovery);
-    let path = dir.path.join("recovery.jsonl");
-    let original = std::fs::read_to_string(&path).unwrap();
-    let mut entries: Vec<serde_json::Value> = original
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    let last = entries.last().unwrap().clone();
-    for (field, value) in [
-        ("executor_id", serde_json::json!("other-node")),
-        ("operation_id", serde_json::json!("other-operation")),
-        ("target_id", serde_json::json!("other-target")),
-        ("outcome", serde_json::json!("not_executed")),
-        ("executor_stopped", serde_json::json!(false)),
-        ("checked_at_ms", serde_json::json!(clock.now_ms() + 1)),
-        ("evidence_refs", serde_json::json!([])),
-    ] {
-        let entry = entries.last_mut().unwrap();
-        *entry = last.clone();
-        entry["task"]["result_check"]["execution"][field] = value;
-        let mut changed = entries
-            .iter()
-            .map(|entry| serde_json::to_string(entry).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n");
-        changed.push('\n');
-        std::fs::write(&path, changed).unwrap();
+    fn diagnose(&mut self) -> ProposedOperation {
+        let effects = self.step(RecoveryEvent::SelectPlan {
+            task_id: self.id.clone(),
+            revision: self.task().revision,
+            observation: observation(),
+            candidate: None,
+        });
         assert!(matches!(
-            open(&dir.path, config(), backend.clone(), clock.clone()),
-            Err(RecoveryError::Corrupt(_))
+            effects.as_slice(),
+            [RecoveryEffect::Diagnose { .. }]
         ));
+        let call_id = self.task().diagnosis_call.clone().unwrap();
+        let effects = self.step(RecoveryEvent::DiagnosisCompleted {
+            task_id: self.id.clone(),
+            revision: self.task().revision,
+            call_id,
+            plan: plan(1),
+        });
+        assert!(matches!(
+            effects.as_slice(),
+            [RecoveryEffect::RequestApproval { .. }]
+        ));
+        self.task().operation.clone().unwrap()
     }
-    std::fs::write(&path, original).unwrap();
-    let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-    assert_eq!(
-        drive(&recovery, &task.id).await.stage,
-        RecoveryStage::Completed
-    );
-    assert_eq!(backend.count("execute"), 1);
-    recovery.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn result_check_cannot_reclassify_a_confirmed_execution_receipt() {
-    let dir = TestDir::new("recovery-result_check-known-execution");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    backend.state.lock().unwrap().verifications.push_back(None);
-    let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-    let task = recovery
-        .submit(problem("incident-known-execution"))
-        .unwrap();
-    let unknown = drive(&recovery, &task.id).await;
-    assert_eq!(unknown.stage, RecoveryStage::Unknown);
-    assert_eq!(
-        unknown.receipt.as_ref().unwrap().outcome,
-        ScriptOutcome::Executed
-    );
-    assert_eq!(
-        recovery.approval(&task.id).unwrap().unwrap().state,
-        ApprovalState::Executed
-    );
-    for outcome in [
-        CheckedExecution::Unknown,
-        CheckedExecution::Failed,
-        CheckedExecution::NotExecuted,
-    ] {
-        assert!(
-            recovery
-                .check_result(
-                    &task.id,
-                    unknown.revision,
-                    execution_evidence(&unknown, outcome, &clock),
-                    business_evidence(&unknown, &clock),
-                    "trusted-operator".into()
-                )
-                .is_err()
-        );
-    }
-    recovery
-        .check_result(
-            &task.id,
-            unknown.revision,
-            execution_evidence(&unknown, CheckedExecution::Executed, &clock),
-            business_evidence(&unknown, &clock),
-            "trusted-operator".into(),
-        )
-        .unwrap();
-    assert_eq!(
-        drive(&recovery, &task.id).await.stage,
-        RecoveryStage::Completed
-    );
-    assert_eq!(backend.count("execute"), 1);
-    recovery.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn result_check_with_unknown_health_stays_recoverable_without_republishing_unknown() {
-    for known_receipt in [false, true] {
-        let dir = TestDir::new("recovery-result_check-health-pending");
-        let clock = Arc::new(Clock::new());
-        let backend = Arc::new(Backend::new(clock.clone()));
-        if known_receipt {
-            backend.state.lock().unwrap().verifications.push_back(None);
-        } else {
-            backend
-                .state
-                .lock()
-                .unwrap()
-                .outcomes
-                .push_back((ScriptOutcome::Unknown, false));
-        }
-        let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-        let task = recovery.submit(problem("incident-health-pending")).unwrap();
-        let mut unknown = drive(&recovery, &task.id).await;
-        assert_eq!(unknown.stage, RecoveryStage::Unknown);
-        let knowledge_id = unknown.knowledge_id.clone().unwrap();
-        let knowledge_path = dir.path.join("knowledge.jsonl");
-        let original_bytes = std::fs::metadata(&knowledge_path).unwrap().len();
-        for attempt in 1..=2 {
-            clock.advance(1);
-            let mut verification = business_evidence(&unknown, &clock);
-            verification.healthy = None;
-            verification.evidence_refs =
-                vec![format!("provider-observation:still-unknown-{attempt}")];
-            unknown = recovery
-                .check_result(
-                    &task.id,
-                    unknown.revision,
-                    execution_evidence(&unknown, CheckedExecution::Executed, &clock),
-                    verification,
-                    "trusted-operator".into(),
-                )
-                .unwrap();
-            assert_eq!(unknown.stage, RecoveryStage::Unknown);
-            assert_eq!(
-                unknown.result_check.as_ref().unwrap().execution.outcome,
-                CheckedExecution::Executed
-            );
-            assert_eq!(
-                recovery.approval(&task.id).unwrap().unwrap().state,
-                ApprovalState::Executed
-            );
-            unknown = drive(&recovery, &task.id).await;
-            assert_eq!(unknown.stage, RecoveryStage::Unknown);
-            assert_eq!(
-                std::fs::metadata(&knowledge_path).unwrap().len(),
-                original_bytes
-            );
-            assert_eq!(backend.count("execute"), 1);
-            assert_eq!(backend.count("diagnose"), 1);
-        }
-        recovery.shutdown().await.unwrap();
-        drop(recovery);
-
-        let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-        let recovered = drive(&recovery, &task.id).await;
-        assert_eq!(recovered.stage, RecoveryStage::Unknown);
-        clock.advance(1);
-        recovery
-            .check_result(
-                &task.id,
-                recovered.revision,
-                execution_evidence(&recovered, CheckedExecution::Executed, &clock),
-                business_evidence(&recovered, &clock),
-                "trusted-operator".into(),
+    fn attach_and_approve(&mut self, op: ProposedOperation) -> String {
+        let pending = self
+            .approvals
+            .prepare_request(
+                format!("request-{}", self.approvals.revision()),
+                op,
+                policy(),
+                100,
             )
             .unwrap();
-        assert_eq!(
-            drive(&recovery, &task.id).await.stage,
-            RecoveryStage::Completed
-        );
-        assert_eq!(backend.count("execute"), 1);
-        assert_eq!(backend.count("diagnose"), 1);
-        recovery.shutdown().await.unwrap();
-        drop(recovery);
-        let knowledge =
-            KnowledgeStore::open(knowledge_path, KnowledgeStoreConfig::default()).unwrap();
-        let record = knowledge.get(&knowledge_id).unwrap();
-        assert_eq!(record.cases.len(), 2);
-        assert_eq!(record.cases[0].result.outcome, RepairOutcome::Unknown);
-        assert_eq!(record.cases[1].result.outcome, RepairOutcome::Verified);
-    }
-}
-
-#[tokio::test]
-async fn replay_rejects_prepared_result_check_conflicting_with_known_receipt() {
-    let dir = TestDir::new("recovery-result_check-prepared-conflict");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    backend.state.lock().unwrap().verifications.push_back(None);
-    let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-    let task = recovery
-        .submit(problem("incident-prepared-conflict"))
-        .unwrap();
-    let unknown = drive(&recovery, &task.id).await;
-    assert_eq!(
-        unknown.receipt.as_ref().unwrap().outcome,
-        ScriptOutcome::Executed
-    );
-    recovery
-        .check_result(
-            &task.id,
-            unknown.revision,
-            execution_evidence(&unknown, CheckedExecution::Executed, &clock),
-            business_evidence(&unknown, &clock),
-            "trusted-operator".into(),
-        )
-        .unwrap();
-    recovery.shutdown().await.unwrap();
-    drop(recovery);
-    let path = dir.path.join("recovery.jsonl");
-    remove_last_journal_entry(&path);
-    let original = std::fs::read_to_string(&path).unwrap();
-    let entries: Vec<serde_json::Value> = original
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(entries.last().unwrap()["task"]["stage"], "unknown");
-    for outcome in ["failed", "not_executed", "unknown"] {
-        let mut changed = entries.clone();
-        changed.last_mut().unwrap()["task"]["result_check"]["execution"]["outcome"] =
-            serde_json::json!(outcome);
-        let mut journal = changed
-            .iter()
-            .map(|entry| serde_json::to_string(entry).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n");
-        journal.push('\n');
-        std::fs::write(&path, journal).unwrap();
-        assert!(matches!(
-            open(&dir.path, config(), backend.clone(), clock.clone()),
-            Err(RecoveryError::Corrupt(_))
-        ));
-    }
-    std::fs::write(&path, original).unwrap();
-    let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-    let recovered = recovery.query(&task.id).unwrap().unwrap();
-    assert_eq!(recovered.stage, RecoveryStage::Unknown);
-    recovery
-        .check_result(
-            &task.id,
-            recovered.revision,
-            execution_evidence(&recovered, CheckedExecution::Executed, &clock),
-            business_evidence(&recovered, &clock),
-            "trusted-operator".into(),
-        )
-        .unwrap();
-    assert_eq!(
-        drive(&recovery, &task.id).await.stage,
-        RecoveryStage::Completed
-    );
-    assert_eq!(backend.count("execute"), 1);
-    recovery.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn verified_repair_is_published_and_restart_reuse_only_calls_independent_reviewer() {
-    let dir = TestDir::new("recovery-reuse");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-    let task = recovery.submit(problem("incident-one")).unwrap();
-    let complete = drive(&recovery, &task.id).await;
-    assert_eq!(complete.stage, RecoveryStage::Completed);
-    assert!(complete.verification.as_ref().unwrap().healthy == Some(true));
-    assert!(complete.knowledge_id.is_some());
-    let mut conditions = facts();
-    conditions.insert("fault_fingerprint".into(), "readiness-rule".into());
-    conditions.insert("platform".into(), "linux".into());
-    let knowledge = recovery
-        .knowledge(&KnowledgeQuery {
-            conditions,
-            keywords: vec!["readiness".into()],
-            limit: 8,
-        })
-        .unwrap();
-    assert_eq!(knowledge.len(), 1);
-    assert_eq!(knowledge[0].status, KnowledgeStatus::Verified);
-    assert!(knowledge[0].cases[0].verification.is_some());
-    assert_eq!(backend.count("diagnose"), 1);
-    assert_eq!(backend.count("review"), 1);
-    assert_eq!(backend.count("execute"), 1);
-    assert_eq!(backend.count("verify"), 1);
-    recovery.shutdown().await.unwrap();
-    drop(recovery);
-    let recovery = open(&dir.path, config(), backend.clone(), clock).unwrap();
-    let second = recovery.submit(problem("incident-two")).unwrap();
-    let reused = drive(&recovery, &second.id).await;
-    assert_eq!(reused.stage, RecoveryStage::Completed);
-    assert!(reused.reused_script);
-    assert_eq!(
-        backend.count("diagnose"),
-        1,
-        "reusing a verified script must not wake the execution model"
-    );
-    assert_eq!(
-        backend.count("review"),
-        2,
-        "every reuse requires a fresh independent review"
-    );
-    assert_eq!(backend.count("execute"), 2);
-    recovery.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn explicit_stopped_execution_failure_runs_a_new_diagnosis_and_new_approval() {
-    let dir = TestDir::new("recovery-failed-script");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    let recovery = open(&dir.path, config(), backend.clone(), clock).unwrap();
-    let seed = recovery.submit(problem("incident-seed-script")).unwrap();
-    assert_eq!(
-        drive(&recovery, &seed.id).await.stage,
-        RecoveryStage::Completed
-    );
-    backend
-        .state
-        .lock()
-        .unwrap()
-        .outcomes
-        .push_back((ScriptOutcome::Failed, true));
-    let task = recovery.submit(problem("incident-failed-action")).unwrap();
-    let result = drive(&recovery, &task.id).await;
-    assert_eq!(result.stage, RecoveryStage::Completed);
-    assert_eq!(backend.count("diagnose"), 2);
-    assert_eq!(backend.count("review"), 3);
-    assert_eq!(backend.count("execute"), 3);
-    recovery.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn unknown_execution_is_never_replayed_or_rediagnosed_even_after_restart() {
-    let dir = TestDir::new("recovery-unknown");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    backend
-        .state
-        .lock()
-        .unwrap()
-        .outcomes
-        .push_back((ScriptOutcome::Unknown, false));
-    let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-    let task = recovery.submit(problem("incident-unknown")).unwrap();
-    assert_eq!(
-        drive(&recovery, &task.id).await.stage,
-        RecoveryStage::Unknown
-    );
-    assert_eq!(
-        drive(&recovery, &task.id).await.stage,
-        RecoveryStage::Unknown
-    );
-    assert_eq!(backend.count("diagnose"), 1);
-    assert_eq!(backend.count("execute"), 1);
-    recovery.shutdown().await.unwrap();
-    drop(recovery);
-    let restarted = open(&dir.path, config(), backend.clone(), clock).unwrap();
-    assert_eq!(
-        drive(&restarted, &task.id).await.stage,
-        RecoveryStage::Unknown
-    );
-    assert_eq!(backend.count("execute"), 1);
-    assert_eq!(backend.count("diagnose"), 1);
-    let unknown = restarted.query(&task.id).unwrap().unwrap();
-    let operation = unknown.operation.as_ref().unwrap();
-    restarted
-        .check_result(
-            &task.id,
-            unknown.revision,
-            ExecutionResultCheck {
-                operation_id: operation.operation_id.clone(),
-                target_id: operation.target.clone(),
-                executor_id: "target-node".into(),
-                outcome: CheckedExecution::Executed,
-                executor_stopped: true,
-                evidence_refs: vec!["executor:durable-operation-result".into()],
-                checked_at_ms: 1_000_000,
-            },
-            BusinessVerification {
-                operation_id: operation.operation_id.clone(),
-                target_id: operation.target.clone(),
-                profile: "workload-ready".into(),
-                healthy: Some(true),
-                executor_stopped: true,
-                evidence_refs: vec!["provider-observation:independent-result_check".into()],
-                verified_at_ms: 1_000_000,
-            },
-            "trusted-operator".into(),
-        )
-        .unwrap();
-    assert_eq!(
-        drive(&restarted, &task.id).await.stage,
-        RecoveryStage::Completed
-    );
-    assert_eq!(backend.count("execute"), 1);
-    assert_eq!(backend.count("diagnose"), 1);
-    restarted.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn business_verification_failure_disqualifies_reuse_and_wakes_diagnosis() {
-    let dir = TestDir::new("recovery-verification-failure");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    let recovery = open(&dir.path, config(), backend.clone(), clock).unwrap();
-    let first = recovery.submit(problem("incident-seed")).unwrap();
-    drive(&recovery, &first.id).await;
-    backend
-        .state
-        .lock()
-        .unwrap()
-        .verifications
-        .push_back(Some(false));
-    let second = recovery
-        .submit(problem("incident-reuse-failed-check"))
-        .unwrap();
-    let result = drive(&recovery, &second.id).await;
-    assert_eq!(result.stage, RecoveryStage::Completed);
-    assert_eq!(backend.count("diagnose"), 2);
-    assert_eq!(backend.count("execute"), 3);
-    assert_eq!(backend.count("review"), 3);
-    recovery.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn human_wait_is_persistent_nonblocking_and_falls_back_only_when_due() {
-    let dir = TestDir::new("recovery-human-wait");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    let mut config = config();
-    config.approval.reviewer = ReviewerConfig::HumanThenHarness {
-        harness_id: "reviewer".into(),
-        human_wait_secs: 2,
-        review_timeout_secs: 30,
-    };
-    let recovery = open(&dir.path, config.clone(), backend.clone(), clock.clone()).unwrap();
-    let task = recovery.submit(problem("incident-human-wait")).unwrap();
-    let waiting = recovery
-        .advance(&task.id, Cancellation::new())
-        .await
-        .unwrap();
-    assert_eq!(waiting.stage, RecoveryStage::AwaitingApproval);
-    let waiting_again = recovery
-        .advance(&task.id, Cancellation::new())
-        .await
-        .unwrap();
-    assert_eq!(waiting_again.stage, RecoveryStage::AwaitingApproval);
-    assert_eq!(backend.count("diagnose"), 1);
-    assert_eq!(backend.count("review"), 0);
-    assert_eq!(backend.count("execute"), 0);
-    let original_request = recovery.approval(&task.id).unwrap().unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(1), recovery.shutdown())
-        .await
-        .unwrap()
-        .unwrap();
-    drop(recovery);
-    clock.advance(1000);
-    let recovery = open(&dir.path, config, backend.clone(), clock.clone()).unwrap();
-    let recovered = recovery.approval(&task.id).unwrap().unwrap();
-    assert_eq!(
-        recovered.request.request_id,
-        original_request.request.request_id
-    );
-    assert_eq!(recovered.human_deadline, original_request.human_deadline);
-    assert_eq!(
-        recovery
-            .advance(&task.id, Cancellation::new())
-            .await
-            .unwrap()
-            .stage,
-        RecoveryStage::AwaitingApproval
-    );
-    assert_eq!(backend.count("diagnose"), 1);
-    assert_eq!(backend.count("review"), 0);
-    clock.advance(1000);
-    assert_eq!(
-        drive(&recovery, &task.id).await.stage,
-        RecoveryStage::Completed
-    );
-    assert_eq!(backend.count("review"), 1);
-    assert_eq!(backend.count("execute"), 1);
-    recovery.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn wrong_target_and_changed_preconditions_cannot_dispatch_an_action() {
-    let dir = TestDir::new("recovery-scope");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    let mut config = config();
-    config.approval.reviewer = ReviewerConfig::HumanThenHarness {
-        harness_id: "reviewer".into(),
-        human_wait_secs: 2,
-        review_timeout_secs: 30,
-    };
-    let recovery = open(&dir.path, config, backend.clone(), clock.clone()).unwrap();
-    let mut outside = problem("incident-outside");
-    outside.target_id = "unconfigured-target".into();
-    assert!(recovery.submit(outside).is_err());
-    let task = recovery.submit(problem("incident-changed-target")).unwrap();
-    recovery
-        .advance(&task.id, Cancellation::new())
-        .await
-        .unwrap();
-    backend
-        .state
-        .lock()
-        .unwrap()
-        .facts
-        .insert("runtime_version".into(), "2".into());
-    clock.advance(2000);
-    let _ = recovery.advance(&task.id, Cancellation::new()).await;
-    assert_eq!(backend.count("execute"), 0);
-    recovery.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn review_failure_or_wrong_identity_never_grants_execution() {
-    for wrong_identity in [false, true] {
-        let dir = TestDir::new("recovery-review-failure");
-        let clock = Arc::new(Clock::new());
-        let backend = Arc::new(Backend::new(clock.clone()));
-        {
-            let mut state = backend.state.lock().unwrap();
-            state.review_error = !wrong_identity;
-            state.wrong_reviewer = wrong_identity;
-        }
-        let recovery = open(&dir.path, config(), backend.clone(), clock).unwrap();
-        let task = recovery
-            .submit(problem("incident-review-unavailable"))
+        self.approvals = commit(pending).0;
+        let record = self.approvals.list().last().unwrap().clone();
+        let id = record.request.request_id.clone();
+        self.step(RecoveryEvent::ApprovalAttached {
+            task_id: self.id.clone(),
+            revision: self.task().revision,
+            record,
+        });
+        let pending = self
+            .approvals
+            .prepare(
+                format!("assess-{}", self.approvals.revision()),
+                ApprovalEvent::Changed {
+                    request_id: id.clone(),
+                    change: ApprovalChange::Assess {
+                        assessment: ApprovalAssessment {
+                            decision: ApprovalDecision::Approve,
+                            reason: "valid".into(),
+                            reviewer: AssessmentSource::Harness {
+                                harness_id: "reviewer".into(),
+                                session_id: "review-session".into(),
+                            },
+                        },
+                    },
+                },
+                Some(&policy()),
+                100,
+            )
             .unwrap();
-        let _ = recovery.advance(&task.id, Cancellation::new()).await;
-        let _ = recovery.advance(&task.id, Cancellation::new()).await;
-        assert_eq!(backend.count("execute"), 0);
-        assert_eq!(backend.count("review"), 1);
-        recovery.shutdown().await.unwrap();
+        self.approvals = commit(pending).0;
+        id
+    }
+    fn consume(&mut self, id: &str) -> ExecutionPermit {
+        let pending = self
+            .approvals
+            .prepare(
+                format!("consume-{}", self.approvals.revision()),
+                ApprovalEvent::Changed {
+                    request_id: id.into(),
+                    change: ApprovalChange::Consume,
+                },
+                Some(&policy()),
+                100,
+            )
+            .unwrap();
+        let (approvals, mut effects) = commit(pending);
+        self.approvals = approvals;
+        match effects.remove(0) {
+            ApprovalEffect::Execute(permit) => permit,
+            _ => panic!("expected permit"),
+        }
+    }
+    fn authorization(&self, permit: ExecutionPermit, id: &str) -> RecoveryCommand {
+        RecoveryCommand::AuthorizeExecution {
+            task_id: self.id.clone(),
+            revision: self.task().revision,
+            permit,
+            approval: self.approvals.get(id).unwrap().clone(),
+            observation: observation(),
+            incident: IncidentEvidence {
+                incident_id: self.task().problem.incident_id.clone(),
+                revision: 1,
+                active: true,
+            },
+            authority: TargetAuthority {
+                target_id: "target".into(),
+                epoch: "ownership-1".into(),
+            },
+        }
+    }
+    fn dispatch(&mut self, id: &str) -> ExecutionPermit {
+        let permit = self.consume(id);
+        let pending = self
+            .state
+            .prepare(
+                format!("dispatch-{}", self.state.revision()),
+                self.authorization(permit, id),
+                100_000,
+                &self.knowledge,
+            )
+            .unwrap();
+        assert_eq!(self.task().stage, RecoveryStage::AwaitingApproval);
+        let (state, mut effects) = commit(pending);
+        self.state = state;
+        match effects.remove(0) {
+            RecoveryEffect::Execute { permit, .. } => permit,
+            _ => panic!("dispatch effect"),
+        }
+    }
+    fn record(&mut self, permit: ExecutionPermit, outcome: ExecutionOutcome) {
+        let id = permit.request_id().to_owned();
+        self.approvals = commit(
+            self.approvals
+                .prepare_complete(
+                    format!("complete-{}", self.approvals.revision()),
+                    permit,
+                    outcome,
+                    "executor evidence".into(),
+                    100,
+                )
+                .unwrap(),
+        )
+        .0;
+        let script_outcome = match outcome {
+            ExecutionOutcome::Executed => ScriptOutcome::Executed,
+            ExecutionOutcome::Failed => ScriptOutcome::Failed,
+            ExecutionOutcome::Unknown => ScriptOutcome::Unknown,
+        };
+        let op = self.task().operation.as_ref().unwrap();
+        self.step(RecoveryEvent::ExecutionRecorded {
+            task_id: self.id.clone(),
+            revision: self.task().revision,
+            receipt: ScriptReceipt {
+                operation_id: op.operation_id.clone(),
+                target_id: "target".into(),
+                outcome: script_outcome,
+                executor_stopped: outcome != ExecutionOutcome::Unknown,
+                evidence_refs: vec!["execution:receipt".into()],
+                summary: "executor result".into(),
+            },
+            approval: self.approvals.get(&id).unwrap().clone(),
+        });
+    }
+    fn verify(&mut self, healthy: Option<bool>) {
+        self.step(RecoveryEvent::VerificationRecorded {
+            task_id: self.id.clone(),
+            revision: self.task().revision,
+            verification: self.verification(healthy),
+        });
+    }
+    fn verification(&self, healthy: Option<bool>) -> BusinessVerification {
+        BusinessVerification {
+            operation_id: self.task().operation.as_ref().unwrap().operation_id.clone(),
+            target_id: "target".into(),
+            profile: "business".into(),
+            healthy,
+            executor_stopped: true,
+            evidence_refs: vec!["business:receipt".into()],
+            verified_at_ms: 100_000,
+        }
+    }
+    fn started() -> (Self, String, ExecutionPermit) {
+        let mut flow = Self::new();
+        flow.register("incident-1");
+        let op = flow.diagnose();
+        let id = flow.attach_and_approve(op);
+        let permit = flow.dispatch(&id);
+        (flow, id, permit)
     }
 }
 
-#[tokio::test]
-async fn recovered_approval_requires_explicit_resume_and_does_not_execute_on_human_decision() {
-    let dir = TestDir::new("recovery-approved-restart");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    let mut config = config();
-    config.approval.reviewer = ReviewerConfig::Human;
-    let recovery = open(&dir.path, config.clone(), backend.clone(), clock.clone()).unwrap();
-    let task = recovery.submit(problem("incident-human-approved")).unwrap();
-    assert_eq!(
-        recovery
-            .advance(&task.id, Cancellation::new())
-            .await
-            .unwrap()
-            .stage,
-        RecoveryStage::AwaitingApproval
-    );
-    let approval = recovery.approval(&task.id).unwrap().unwrap();
-    recovery
-        .decide_human(
-            &task.id,
-            approval.revision,
-            ApprovalDecision::Approve,
-            "operator".into(),
-            "reviewed exact action".into(),
-        )
-        .unwrap();
-    assert_eq!(backend.count("execute"), 0);
-    recovery.shutdown().await.unwrap();
-    drop(recovery);
-    let restarted = open(&dir.path, config, backend.clone(), clock).unwrap();
-    let paused = restarted
-        .advance(&task.id, Cancellation::new())
-        .await
-        .unwrap();
-    assert_eq!(paused.stage, RecoveryStage::Paused);
-    assert_eq!(backend.count("execute"), 0);
-    assert!(restarted.resume(&task.id, paused.revision - 1).is_err());
-    restarted.resume(&task.id, paused.revision).unwrap();
-    assert_eq!(
-        drive(&restarted, &task.id).await.stage,
-        RecoveryStage::Completed
-    );
-    assert_eq!(backend.count("diagnose"), 1);
-    assert_eq!(backend.count("execute"), 1);
-    restarted.shutdown().await.unwrap();
+#[test]
+fn complete_repair_does_not_wait_for_knowledge_delivery_and_preserves_outbox() {
+    let (mut flow, _, permit) = Flow::started();
+    flow.record(permit, ExecutionOutcome::Executed);
+    flow.verify(Some(true));
+    assert_eq!(flow.task().stage, RecoveryStage::Completed);
+    let delivery = flow.state.pending_deliveries()[0].clone();
+    assert_eq!(delivery.case.outcome, RepairOutcome::Verified);
+    assert!(delivery.verification.is_some());
+    flow.register("incident-2"); // Host's knowledge module may still be unavailable.
+    assert_eq!(flow.task().episode_count, 2);
+    assert_eq!(flow.state.pending_deliveries()[0].id, delivery.id);
+    flow.step(RecoveryEvent::DeliveryConfirmed {
+        delivery_id: delivery.id.clone(),
+    });
+    flow.step(RecoveryEvent::DeliveryConfirmed {
+        delivery_id: delivery.id,
+    });
+    assert!(flow.state.pending_deliveries().is_empty());
 }
 
-#[tokio::test]
-async fn dropped_advance_cancels_and_shutdown_drains_the_owned_execution() {
-    let dir = TestDir::new("recovery-drop-drain");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    let gate = Arc::new(tokio::sync::Notify::new());
-    *backend.execution_gate.lock().unwrap() = Some(gate.clone());
-    let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-    let task = recovery.submit(problem("incident-drain")).unwrap();
-    let caller = tokio::spawn({
-        let recovery = recovery.clone();
-        let id = task.id.clone();
-        async move { recovery.advance(&id, Cancellation::new()).await }
+#[test]
+fn failed_new_plan_is_terminal_and_quarantine_precedes_delivery() {
+    let (mut flow, _, permit) = Flow::started();
+    flow.record(permit, ExecutionOutcome::Failed);
+    assert_eq!(flow.task().stage, RecoveryStage::Failed);
+    assert!(flow.state.is_quarantined("script", 1));
+    assert_eq!(flow.task().diagnosis_attempts, 1);
+    flow.register("incident-2");
+    flow.step(RecoveryEvent::SelectPlan {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        observation: observation(),
+        candidate: None,
     });
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        backend.execution_entered.notified(),
-    )
-    .await
-    .unwrap();
-    caller.abort();
-    assert!(caller.await.unwrap_err().is_cancelled());
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        backend.cancellation_seen.notified(),
-    )
-    .await
-    .unwrap();
-    let shutdown = tokio::spawn({
-        let recovery = recovery.clone();
-        async move { recovery.shutdown().await }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let event = RecoveryEvent::DiagnosisCompleted {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        call_id: flow.task().diagnosis_call.clone().unwrap(),
+        plan: plan(1),
+    };
     assert!(
-        !shutdown.is_finished(),
-        "shutdown must retain ownership until execution cleanup finishes"
+        flow.state
+            .prepare(
+                "repeat-script",
+                RecoveryCommand::Event(event),
+                100_000,
+                &flow.knowledge
+            )
+            .is_err()
     );
-    gate.notify_one();
-    tokio::time::timeout(std::time::Duration::from_secs(2), shutdown)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    drop(recovery);
-    let restarted = open(&dir.path, config(), backend.clone(), clock).unwrap();
+}
+
+#[test]
+fn unknown_execution_blocks_new_tasks_and_never_dispatches_on_restore() {
+    let (mut flow, _, permit) = Flow::started();
+    flow.record(permit, ExecutionOutcome::Unknown);
+    assert_eq!(flow.task().stage, RecoveryStage::Unknown);
+    assert!(flow.state.is_quarantined("script", 1));
+    let restored = RecoveryState::restore(config(), flow.state.entries()).unwrap();
+    assert!(restored.recovery_required());
     assert_eq!(
-        drive(&restarted, &task.id).await.stage,
+        restored.task(&flow.id).unwrap().stage,
         RecoveryStage::Unknown
     );
-    assert_eq!(backend.count("execute"), 1);
-    restarted.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn knowledge_publication_conflict_retries_only_publication_even_after_restart() {
-    let dir = TestDir::new("recovery-publish-conflict");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-    let task = recovery
-        .submit(problem("incident-publish-conflict"))
-        .unwrap();
-    recovery.shutdown().await.unwrap();
-    drop(recovery);
-    // Seed an existing, incompatible candidate using the public knowledge API.
-    // It deterministically rejects this workflow's publication after execution.
-    let mut knowledge = KnowledgeStore::open(
-        dir.path.join("knowledge.jsonl"),
-        KnowledgeStoreConfig::default(),
-    )
-    .unwrap();
-    knowledge
-        .upsert_candidate(KnowledgeCandidate {
-            id: format!("case-{}-1", task.id),
-            incident_id: "another-incident".into(),
-            summary: "existing unrelated candidate".into(),
-            reusable: false,
-            keywords: vec!["unrelated".into()],
-            conditions: facts(),
-            script: ScriptArtifact {
-                id: "other-script".into(),
-                version: 1,
-                language: "sh".into(),
-                platform: "linux".into(),
-                source: "exit 1".into(),
-                preconditions: facts(),
-                generated_by_harness: "executor".into(),
-                generated_in_session: "prior-session".into(),
-            },
-            evidence_refs: vec!["provider-observation:prior-candidate".into()],
-            created_at_ms: clock.now_ms(),
-        })
-        .unwrap();
-    knowledge.close().unwrap();
-    drop(knowledge);
-    let recovery = open(&dir.path, config(), backend.clone(), clock.clone()).unwrap();
-    assert!(
-        recovery
-            .advance(&task.id, Cancellation::new())
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        recovery.query(&task.id).unwrap().unwrap().stage,
-        RecoveryStage::Publishing
-    );
-    assert_eq!(backend.count("execute"), 1);
-    assert_eq!(backend.count("verify"), 1);
-    assert!(
-        recovery
-            .advance(&task.id, Cancellation::new())
-            .await
-            .is_err()
-    );
-    assert_eq!(backend.count("execute"), 1);
-    assert_eq!(backend.count("diagnose"), 1);
-    recovery.shutdown().await.unwrap();
-    drop(recovery);
-    let restarted = open(&dir.path, config(), backend.clone(), clock).unwrap();
-    assert!(
-        restarted
-            .advance(&task.id, Cancellation::new())
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        restarted.query(&task.id).unwrap().unwrap().stage,
-        RecoveryStage::Publishing
-    );
-    assert_eq!(backend.count("execute"), 1);
-    assert_eq!(backend.count("verify"), 1);
-    restarted.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn human_handoff_respects_the_shorter_policy_review_timeout() {
-    let dir = TestDir::new("recovery-policy-timeout");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    let mut config = config();
-    config.review_timeout_secs = 60;
-    config.approval.reviewer = ReviewerConfig::HumanThenHarness {
-        harness_id: "reviewer".into(),
-        human_wait_secs: 15,
-        review_timeout_secs: 15,
+    flow.state = restored;
+    assert!(flow.step(RecoveryEvent::Recover).is_empty());
+    let event = RecoveryEvent::Register {
+        problem: problem("incident-2"),
+        incident: IncidentEvidence {
+            incident_id: "incident-2".into(),
+            revision: 1,
+            active: true,
+        },
     };
-    let recovery = open(&dir.path, config, backend.clone(), clock.clone()).unwrap();
-    let task = recovery
-        .submit(problem("incident-policy-deadline"))
-        .unwrap();
-    assert_eq!(
-        recovery
-            .advance(&task.id, Cancellation::new())
-            .await
-            .unwrap()
-            .stage,
-        RecoveryStage::AwaitingApproval
-    );
-    clock.advance(14_999);
-    assert_eq!(
-        recovery
-            .advance(&task.id, Cancellation::new())
-            .await
-            .unwrap()
-            .stage,
-        RecoveryStage::AwaitingApproval
-    );
-    assert_eq!(backend.count("review"), 0);
-    clock.advance(1);
-    assert_eq!(
-        drive(&recovery, &task.id).await.stage,
-        RecoveryStage::Completed
-    );
-    assert_eq!(backend.state.lock().unwrap().review_timeouts, vec![15]);
-    assert_eq!(backend.count("execute"), 1);
-    recovery.shutdown().await.unwrap();
+    assert!(matches!(
+        flow.state.prepare(
+            "other-task",
+            RecoveryCommand::Event(event),
+            100_000,
+            &flow.knowledge
+        ),
+        Err(RecoveryError::Busy)
+    ));
 }
 
-#[tokio::test]
-async fn every_solution_is_published_but_reuse_waits_for_repeated_episodes() {
-    let dir = TestDir::new("recovery-episode-frequency");
-    let clock = Arc::new(Clock::new());
-    let backend = Arc::new(Backend::new(clock.clone()));
-    let mut config = config();
-    config.minimum_script_occurrences = 2;
-    let recovery = open(&dir.path, config, backend.clone(), clock).unwrap();
-    let mut first = problem("incident-frequency-first");
-    first.occurrences = 1;
-    let first = recovery.submit(first).unwrap();
-    let result = drive(&recovery, &first.id).await;
-    assert_eq!(result.stage, RecoveryStage::Completed);
-    assert_eq!(result.problem.occurrences, 1);
-    assert_eq!(result.episode_count, 1);
-    assert!(result.knowledge_id.is_some());
-    let mut conditions = facts();
-    conditions.insert("fault_fingerprint".into(), "readiness-rule".into());
-    conditions.insert("platform".into(), "linux".into());
-    let query = KnowledgeQuery {
-        conditions,
-        keywords: vec!["readiness".into()],
-        limit: 8,
-    };
-    let first_cases = recovery.knowledge(&query).unwrap();
-    assert_eq!(first_cases.len(), 1);
-    assert!(!first_cases[0].candidate.reusable);
-    let mut second = problem("incident-frequency-second");
-    second.occurrences = 1;
-    let second = recovery.submit(second).unwrap();
-    assert_eq!(second.problem.occurrences, 1);
-    assert_eq!(second.episode_count, 2);
-    let result = drive(&recovery, &second.id).await;
-    assert_eq!(result.stage, RecoveryStage::Completed);
-    assert!(result.knowledge_id.is_some());
-    assert_eq!(backend.count("diagnose"), 2);
-    assert_eq!(backend.state.lock().unwrap().knowledge_seen, vec![0, 1]);
-    let cases = recovery.knowledge(&query).unwrap();
-    assert_eq!(cases.len(), 2);
+#[test]
+fn interrupted_dispatch_is_quarantined_before_reconciliation() {
+    let (mut flow, _, _permit) = Flow::started();
+    flow.state = RecoveryState::restore(config(), flow.state.entries()).unwrap();
+    let effects = flow.step(RecoveryEvent::Recover);
+    assert_eq!(flow.task().stage, RecoveryStage::Unknown);
+    assert!(flow.state.is_quarantined("script", 1));
+    assert!(matches!(
+        effects.as_slice(),
+        [RecoveryEffect::DeliverKnowledge(_)]
+    ));
     assert_eq!(
-        cases.iter().filter(|case| case.candidate.reusable).count(),
+        flow.state.pending_deliveries()[0].case.outcome,
+        RepairOutcome::Unknown
+    );
+}
+
+#[test]
+fn restored_approval_must_recover_and_explicitly_resume_original_intent() {
+    let mut flow = Flow::new();
+    flow.register("incident-1");
+    let op = flow.diagnose();
+    let id = flow.attach_and_approve(op.clone());
+    flow.state = RecoveryState::restore(config(), flow.state.entries()).unwrap();
+    let pending = flow.state.prepare(
+        "bypass",
+        RecoveryCommand::Event(RecoveryEvent::Resume {
+            task_id: flow.id.clone(),
+            revision: flow.task().revision,
+        }),
+        100_000,
+        &flow.knowledge,
+    );
+    assert!(pending.is_err());
+    flow.step(RecoveryEvent::Recover);
+    assert_eq!(flow.task().stage, RecoveryStage::Paused);
+    let revision = flow.task().revision;
+    flow.step(RecoveryEvent::Resume {
+        task_id: flow.id.clone(),
+        revision,
+    });
+    assert_eq!(flow.task().operation.as_ref(), Some(&op));
+    let permit = flow.dispatch(&id);
+    assert_eq!(permit.operation(), &op);
+}
+
+#[test]
+fn interrupted_diagnosis_consumes_budget_and_rejects_late_callback() {
+    let mut flow = Flow::new();
+    flow.register("incident-1");
+    flow.step(RecoveryEvent::SelectPlan {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        observation: observation(),
+        candidate: None,
+    });
+    let old = flow.task().clone();
+    flow.state = RecoveryState::restore(config(), flow.state.entries()).unwrap();
+    flow.step(RecoveryEvent::Recover);
+    assert_eq!(flow.task().diagnosis_attempts, 1);
+    let event = RecoveryEvent::DiagnosisCompleted {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        call_id: old.diagnosis_call.unwrap(),
+        plan: plan(1),
+    };
+    assert!(
+        flow.state
+            .prepare(
+                "late",
+                RecoveryCommand::Event(event),
+                100_000,
+                &flow.knowledge
+            )
+            .is_err()
+    );
+    flow.step(RecoveryEvent::RetryDiagnosis {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        observation: observation(),
+    });
+    assert_eq!(flow.task().diagnosis_attempts, 2);
+}
+
+#[test]
+fn replay_rejects_changed_operation_and_bad_sequence() {
+    let (flow, _, _permit) = Flow::started();
+    let mut entries = flow.state.entries().to_vec();
+    entries[1].request.revision += 1;
+    assert!(RecoveryState::restore(config(), &entries).is_err());
+    let mut entries = flow.state.entries().to_vec();
+    if let RecoveryEvent::ExecutionAuthorized { approval, .. } =
+        &mut entries.last_mut().unwrap().event
+    {
+        approval.request.operation.target = "other".into();
+    }
+    assert!(RecoveryState::restore(config(), &entries).is_err());
+}
+
+#[test]
+fn current_environment_revision_and_owned_permit_are_required() {
+    let mut flow = Flow::new();
+    flow.register("incident-1");
+    let op = flow.diagnose();
+    let id = flow.attach_and_approve(op);
+    let permit = flow.consume(&id);
+    let mut command = flow.authorization(permit, &id);
+    if let RecoveryCommand::AuthorizeExecution { observation, .. } = &mut command {
+        observation
+            .facts
+            .insert("environment".into(), "changed".into());
+    }
+    assert!(
+        flow.state
+            .prepare("bad-environment", command, 100_000, &flow.knowledge)
+            .is_err()
+    );
+    assert_eq!(flow.task().stage, RecoveryStage::AwaitingApproval);
+    let event = RecoveryEvent::ExecutionAuthorized {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        approval: flow.approvals.get(&id).unwrap().clone(),
+        observation: observation(),
+        incident: IncidentEvidence {
+            incident_id: "incident-1".into(),
+            revision: 1,
+            active: true,
+        },
+        authority: TargetAuthority {
+            target_id: "target".into(),
+            epoch: "epoch".into(),
+        },
+    };
+    assert!(
+        flow.state
+            .prepare(
+                "forged",
+                RecoveryCommand::Event(event),
+                100_000,
+                &flow.knowledge
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn independent_result_check_cannot_infer_execution_from_health() {
+    let (mut flow, id, permit) = Flow::started();
+    flow.record(permit, ExecutionOutcome::Unknown);
+    let operation = flow.task().operation.as_ref().unwrap().clone();
+    let event = RecoveryEvent::ResultChecked {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        execution: ExecutionResultCheck {
+            operation_id: operation.operation_id,
+            target_id: "target".into(),
+            executor_id: "executor".into(),
+            outcome: CheckedExecution::Unknown,
+            executor_stopped: true,
+            evidence_refs: vec!["executor:unknown".into()],
+            checked_at_ms: 100_000,
+        },
+        verification: flow.verification(Some(true)),
+        actor: "operator".into(),
+        approval: flow.approvals.get(&id).unwrap().clone(),
+    };
+    flow.step(event);
+    assert_eq!(flow.task().stage, RecoveryStage::Unknown);
+    assert!(flow.state.is_quarantined("script", 1));
+}
+
+#[test]
+fn proposal_rejection_does_not_mutate_workflow_or_charge_diagnosis() {
+    let mut flow = Flow::new();
+    flow.register("incident-1");
+    let event = RecoveryEvent::SelectPlan {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        observation: observation(),
+        candidate: None,
+    };
+    let pending = flow
+        .state
+        .prepare(
+            "uncommitted",
+            RecoveryCommand::Event(event),
+            100_000,
+            &flow.knowledge,
+        )
+        .unwrap();
+    assert_eq!(
+        pending.state().task(&flow.id).unwrap().diagnosis_attempts,
         1
     );
-    let mut third = problem("incident-frequency-third");
-    third.occurrences = 1;
-    let third = recovery.submit(third).unwrap();
-    let result = drive(&recovery, &third.id).await;
-    assert_eq!(result.stage, RecoveryStage::Completed);
-    assert_eq!(result.problem.occurrences, 1);
-    assert_eq!(result.episode_count, 3);
-    assert!(result.reused_script);
+    drop(pending);
+    assert_eq!(flow.task().diagnosis_attempts, 0);
+    assert_eq!(flow.task().stage, RecoveryStage::Queued);
+}
+
+#[test]
+fn diagnosis_callback_uses_revision_from_committed_effect() {
+    let mut flow = Flow::new();
+    flow.register("incident-1");
+    let mut effects = flow.step(RecoveryEvent::SelectPlan {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        observation: observation(),
+        candidate: None,
+    });
+    let RecoveryEffect::Diagnose { task, call_id, .. } = effects.remove(0) else {
+        panic!("diagnosis effect")
+    };
+    assert_eq!(task.revision, flow.task().revision);
+    flow.step(RecoveryEvent::DiagnosisCompleted {
+        task_id: task.id,
+        revision: task.revision,
+        call_id,
+        plan: plan(1),
+    });
+    assert_eq!(flow.task().stage, RecoveryStage::AwaitingApproval);
+}
+
+#[test]
+fn result_check_prepares_evidence_before_approval_finalization_without_losing_isolation() {
+    let (mut flow, id, permit) = Flow::started();
+    flow.record(permit, ExecutionOutcome::Unknown);
+    let execution = ExecutionResultCheck {
+        operation_id: flow.task().operation.as_ref().unwrap().operation_id.clone(),
+        target_id: "target".into(),
+        executor_id: "executor".into(),
+        outcome: CheckedExecution::Executed,
+        executor_stopped: true,
+        evidence_refs: vec!["executor:confirmed".into()],
+        checked_at_ms: 100_000,
+    };
+    flow.step(RecoveryEvent::ResultChecked {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        execution: execution.clone(),
+        verification: flow.verification(Some(true)),
+        actor: "operator".into(),
+        approval: flow.approvals.get(&id).unwrap().clone(),
+    });
+    assert_eq!(flow.task().stage, RecoveryStage::Unknown);
     assert_eq!(
-        backend.count("diagnose"),
-        2,
-        "third occurrence should reuse the verified script"
+        flow.task().result_check.as_ref().unwrap().execution.outcome,
+        CheckedExecution::Executed
     );
-    assert_eq!(backend.count("review"), 3);
-    assert_eq!(backend.count("execute"), 3);
-    recovery.shutdown().await.unwrap();
+    flow.state = RecoveryState::restore(config(), flow.state.entries()).unwrap();
+    flow.step(RecoveryEvent::Recover);
+    let pending = flow
+        .approvals
+        .prepare(
+            "reconciled".into(),
+            ApprovalEvent::Changed {
+                request_id: id.clone(),
+                change: ApprovalChange::Reconcile {
+                    outcome: ExecutionOutcome::Executed,
+                    reason: "independent evidence".into(),
+                    actor: "operator".into(),
+                },
+            },
+            Some(&policy()),
+            100,
+        )
+        .unwrap();
+    flow.approvals = commit(pending).0;
+    flow.step(RecoveryEvent::ResultChecked {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        execution,
+        verification: flow.verification(Some(true)),
+        actor: "operator".into(),
+        approval: flow.approvals.get(&id).unwrap().clone(),
+    });
+    assert_eq!(flow.task().stage, RecoveryStage::Completed);
+    assert!(flow.state.is_quarantined("script", 1));
+    let outcomes: Vec<_> = flow
+        .state
+        .pending_deliveries()
+        .iter()
+        .map(|d| d.case.outcome)
+        .collect();
+    assert!(outcomes.contains(&RepairOutcome::Unknown));
+    assert!(outcomes.contains(&RepairOutcome::Verified));
+}
+
+#[test]
+fn unlinked_original_approval_recovers_without_new_diagnosis_or_operation() {
+    let mut flow = Flow::new();
+    flow.register("incident-1");
+    let original = flow.diagnose();
+    let attempts = flow.task().diagnosis_attempts;
+    flow.state = RecoveryState::restore(config(), flow.state.entries()).unwrap();
+    flow.step(RecoveryEvent::Recover);
+    let effects = flow.step(RecoveryEvent::Resume {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+    });
+    assert!(
+        matches!(effects.as_slice(),[RecoveryEffect::RequestApproval{operation,..}] if operation==&original)
+    );
+    assert_eq!(flow.task().diagnosis_attempts, attempts);
+    assert_eq!(flow.task().operation.as_ref(), Some(&original));
+}
+
+#[test]
+fn known_execution_with_unknown_business_health_rechecks_verification_only() {
+    let (mut flow, id, permit) = Flow::started();
+    flow.record(permit, ExecutionOutcome::Executed);
+    flow.verify(None);
+    assert_eq!(flow.task().stage, RecoveryStage::Unknown);
+    let execution = ExecutionResultCheck {
+        operation_id: flow.task().operation.as_ref().unwrap().operation_id.clone(),
+        target_id: "target".into(),
+        executor_id: "executor".into(),
+        outcome: CheckedExecution::Executed,
+        executor_stopped: true,
+        evidence_refs: vec!["executor:confirmed".into()],
+        checked_at_ms: 100_000,
+    };
+    let effects = flow.step(RecoveryEvent::ResultChecked {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        execution,
+        verification: flow.verification(Some(true)),
+        actor: "operator".into(),
+        approval: flow.approvals.get(&id).unwrap().clone(),
+    });
+    assert_eq!(flow.task().stage, RecoveryStage::Completed);
+    assert!(matches!(
+        effects.as_slice(),
+        [RecoveryEffect::DeliverKnowledge(_)]
+    ));
+    assert!(flow.state.is_quarantined("script", 1));
+}
+
+fn deliver(flow: &mut Flow, delivery: KnowledgeDelivery) {
+    let pending = flow
+        .knowledge
+        .propose(
+            format!("candidate-{}", flow.knowledge.revision()),
+            KnowledgeCommand::UpsertCandidate(delivery.candidate),
+        )
+        .unwrap();
+    flow.knowledge = commit(pending).0;
+    let proof = delivery.verification.map(|v| {
+        TrustedBusinessVerification::attest(
+            v.operation_id,
+            v.target_id,
+            v.script_id,
+            v.script_version,
+            v.verifier_id,
+            v.evidence_refs,
+            v.verified_at_ms,
+        )
+        .unwrap()
+    });
+    let candidate_id = flow
+        .knowledge
+        .snapshot()
+        .records
+        .iter()
+        .find(|r| r.candidate.script.id == delivery.case.script_id)
+        .unwrap()
+        .id
+        .clone();
+    flow.knowledge = commit(
+        flow.knowledge
+            .propose(
+                format!("case-{}", flow.knowledge.revision()),
+                KnowledgeCommand::RecordOutcome {
+                    record_id: candidate_id,
+                    case: delivery.case,
+                    verification: proof,
+                },
+            )
+            .unwrap(),
+    )
+    .0;
+}
+fn reusable_flow() -> Flow {
+    let (mut flow, _, permit) = Flow::started();
+    flow.record(permit, ExecutionOutcome::Executed);
+    flow.verify(Some(true));
+    let delivery = flow.state.pending_deliveries()[0].clone();
+    deliver(&mut flow, delivery);
+    flow.register("incident-2");
+    let candidate = flow.knowledge.snapshot().records[0].clone();
+    flow.step(RecoveryEvent::SelectPlan {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        observation: observation(),
+        candidate: Some(candidate),
+    });
+    assert!(flow.task().reused_script);
+    assert_eq!(flow.task().diagnosis_attempts, 0);
+    flow
+}
+
+#[test]
+fn reused_failure_requires_new_version_diagnosis_and_fresh_approval() {
+    let mut flow = reusable_flow();
+    let op = flow.task().operation.clone().unwrap();
+    let old = op.operation_id.clone();
+    let id = flow.attach_and_approve(op);
+    let permit = flow.dispatch(&id);
+    flow.record(permit, ExecutionOutcome::Failed);
+    assert_eq!(flow.task().stage, RecoveryStage::Diagnosing);
+    assert!(flow.state.is_quarantined("script", 1));
+    let mut effects = flow.step(RecoveryEvent::RetryDiagnosis {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        observation: observation(),
+    });
+    let RecoveryEffect::Diagnose { task, call_id, .. } = effects.remove(0) else {
+        panic!("diagnose")
+    };
+    let effects = flow.step(RecoveryEvent::DiagnosisCompleted {
+        task_id: task.id,
+        revision: task.revision,
+        call_id,
+        plan: plan(2),
+    });
+    assert!(
+        matches!(effects.as_slice(),[RecoveryEffect::RequestApproval{operation,..}] if operation.operation_id != old)
+    );
+    assert!(flow.task().approval_id.is_none());
+}
+
+#[test]
+fn human_denial_of_reuse_is_terminal_but_harness_denial_allows_alternative() {
+    for human in [true, false] {
+        let mut flow = reusable_flow();
+        let op = flow.task().operation.clone().unwrap();
+        flow.approvals = commit(
+            flow.approvals
+                .prepare_request(
+                    format!("reuse-request-{}", flow.approvals.revision()),
+                    op,
+                    policy(),
+                    100,
+                )
+                .unwrap(),
+        )
+        .0;
+        let mut record = flow.approvals.list().last().unwrap().clone();
+        let id = record.request.request_id.clone();
+        flow.step(RecoveryEvent::ApprovalAttached {
+            task_id: flow.id.clone(),
+            revision: flow.task().revision,
+            record: record.clone(),
+        });
+        let assessment = ApprovalAssessment {
+            decision: ApprovalDecision::Deny,
+            reason: "not appropriate".into(),
+            reviewer: if human {
+                AssessmentSource::Human {
+                    actor: "operator".into(),
+                }
+            } else {
+                AssessmentSource::Harness {
+                    harness_id: "reviewer".into(),
+                    session_id: "review-session".into(),
+                }
+            },
+        };
+        let change = if human {
+            ApprovalChange::HumanDecision {
+                expected_revision: record.revision,
+                assessment,
+            }
+        } else {
+            ApprovalChange::Assess { assessment }
+        };
+        flow.approvals = commit(
+            flow.approvals
+                .prepare(
+                    "deny-reuse".into(),
+                    ApprovalEvent::Changed {
+                        request_id: id.clone(),
+                        change,
+                    },
+                    Some(&policy()),
+                    100,
+                )
+                .unwrap(),
+        )
+        .0;
+        record = flow.approvals.get(&id).unwrap().clone();
+        flow.step(RecoveryEvent::ApprovalResolved {
+            task_id: flow.id.clone(),
+            revision: flow.task().revision,
+            record,
+        });
+        assert_eq!(
+            flow.task().stage,
+            if human {
+                RecoveryStage::Denied
+            } else {
+                RecoveryStage::Diagnosing
+            }
+        );
+    }
+}
+
+#[test]
+fn reusable_candidate_accepts_case_count_above_default_budget() {
+    let (mut flow, _, permit) = Flow::started();
+    flow.record(permit, ExecutionOutcome::Executed);
+    flow.verify(Some(true));
+    flow.knowledge = KnowledgeState::new(KnowledgeConfig {
+        max_records: 10,
+        max_cases_per_record: 256,
+    })
+    .unwrap();
+    let delivery = flow.state.pending_deliveries()[0].clone();
+    deliver(&mut flow, delivery.clone());
+    for index in 0..128 {
+        let mut case = delivery.case.clone();
+        case.id = format!("verified-{index}");
+        case.operation_id = format!("operation-{index}");
+        let v = delivery.verification.as_ref().unwrap();
+        let proof = TrustedBusinessVerification::attest(
+            &case.operation_id,
+            &case.target_id,
+            &case.script_id,
+            case.script_version,
+            &v.verifier_id,
+            v.evidence_refs.clone(),
+            v.verified_at_ms,
+        )
+        .unwrap();
+        flow.knowledge = commit(
+            flow.knowledge
+                .propose(
+                    format!("extra-{index}"),
+                    KnowledgeCommand::RecordOutcome {
+                        record_id: delivery.candidate.id.clone(),
+                        case,
+                        verification: Some(proof),
+                    },
+                )
+                .unwrap(),
+        )
+        .0;
+    }
+    flow.register("incident-2");
+    let candidate = flow.knowledge.get(&delivery.candidate.id).unwrap();
+    assert_eq!(candidate.cases.len(), 129);
+    flow.step(RecoveryEvent::SelectPlan {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        observation: observation(),
+        candidate: Some(candidate),
+    });
+    assert!(flow.task().reused_script);
+}
+
+#[test]
+fn still_fresh_prepared_evidence_survives_time_advancing_between_commits() {
+    let (mut flow, id, permit) = Flow::started();
+    flow.record(permit, ExecutionOutcome::Unknown);
+    let execution = ExecutionResultCheck {
+        operation_id: flow.task().operation.as_ref().unwrap().operation_id.clone(),
+        target_id: "target".into(),
+        executor_id: "executor".into(),
+        outcome: CheckedExecution::Failed,
+        executor_stopped: true,
+        evidence_refs: vec!["executor:failed".into()],
+        checked_at_ms: 100_100,
+    };
+    let mut verification = flow.verification(Some(false));
+    verification.verified_at_ms = 100_100;
+    let event = RecoveryEvent::ResultChecked {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        execution: execution.clone(),
+        verification: verification.clone(),
+        actor: "operator".into(),
+        approval: flow.approvals.get(&id).unwrap().clone(),
+    };
+    flow.state = commit(
+        flow.state
+            .prepare(
+                "prepared-result",
+                RecoveryCommand::Event(event),
+                100_200,
+                &flow.knowledge,
+            )
+            .unwrap(),
+    )
+    .0;
+    flow.approvals = commit(
+        flow.approvals
+            .prepare(
+                "result-reconciled".into(),
+                ApprovalEvent::Changed {
+                    request_id: id.clone(),
+                    change: ApprovalChange::Reconcile {
+                        outcome: ExecutionOutcome::Failed,
+                        reason: "executor stopped".into(),
+                        actor: "operator".into(),
+                    },
+                },
+                Some(&policy()),
+                101,
+            )
+            .unwrap(),
+    )
+    .0;
+    let event = RecoveryEvent::ResultChecked {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        execution,
+        verification,
+        actor: "operator".into(),
+        approval: flow.approvals.get(&id).unwrap().clone(),
+    };
+    let (state, effects) = commit(
+        flow.state
+            .prepare(
+                "final-result",
+                RecoveryCommand::Event(event),
+                101_200,
+                &flow.knowledge,
+            )
+            .unwrap(),
+    );
+    flow.state = state;
+    assert_eq!(flow.task().stage, RecoveryStage::Failed);
+    let pending = flow.state.pending_deliveries();
+    assert_eq!(pending[0].case.outcome, RepairOutcome::Unknown);
+    assert_eq!(pending[1].case.outcome, RepairOutcome::Failed);
+    assert!(
+        matches!(effects.as_slice(),[RecoveryEffect::DeliverKnowledge(delivery)] if delivery.id==pending[0].id)
+    );
+    let event = RecoveryEvent::DeliveryConfirmed {
+        delivery_id: pending[1].id.clone(),
+    };
+    assert!(
+        flow.state
+            .prepare(
+                "out-of-order",
+                RecoveryCommand::Event(event),
+                101_200,
+                &flow.knowledge
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn completed_approval_without_task_receipt_can_enter_explicit_reconciliation() {
+    let mut flow = Flow::new();
+    flow.register("incident-1");
+    let op = flow.diagnose();
+    let id = flow.attach_and_approve(op);
+    let permit = flow.consume(&id);
+    flow.approvals = commit(
+        flow.approvals
+            .prepare_complete(
+                "external-complete".into(),
+                permit,
+                ExecutionOutcome::Executed,
+                "executor result".into(),
+                100,
+            )
+            .unwrap(),
+    )
+    .0;
+    flow.step(RecoveryEvent::ApprovalResolved {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        record: flow.approvals.get(&id).unwrap().clone(),
+    });
+    assert_eq!(flow.task().stage, RecoveryStage::Unknown);
+    assert!(flow.state.is_quarantined("script", 1));
+    let execution = ExecutionResultCheck {
+        operation_id: flow.task().operation.as_ref().unwrap().operation_id.clone(),
+        target_id: "target".into(),
+        executor_id: "executor".into(),
+        outcome: CheckedExecution::Executed,
+        executor_stopped: true,
+        evidence_refs: vec!["executor:confirmed".into()],
+        checked_at_ms: 100_000,
+    };
+    flow.step(RecoveryEvent::ResultChecked {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        execution,
+        verification: flow.verification(Some(true)),
+        actor: "operator".into(),
+        approval: flow.approvals.get(&id).unwrap().clone(),
+    });
+    assert_eq!(flow.task().stage, RecoveryStage::Completed);
 }

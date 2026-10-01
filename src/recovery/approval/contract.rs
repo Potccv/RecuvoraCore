@@ -262,27 +262,21 @@ pub enum ExecutionOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct ApprovalStoreConfig {
+pub struct ApprovalLimits {
     pub max_requests: usize,
-    pub max_journal_bytes: u64,
 }
 
-impl Default for ApprovalStoreConfig {
+impl Default for ApprovalLimits {
     fn default() -> Self {
         Self {
             max_requests: 10_000,
-            max_journal_bytes: 32 * 1024 * 1024,
         }
     }
 }
 
-impl ApprovalStoreConfig {
+impl ApprovalLimits {
     pub fn validate(&self) -> Result<(), ApprovalError> {
-        if self.max_requests == 0
-            || self.max_requests > 100_000
-            || self.max_journal_bytes == 0
-            || self.max_journal_bytes > 128 * 1024 * 1024
-        {
+        if self.max_requests == 0 || self.max_requests > 100_000 {
             return Err(ApprovalError::Invalid("store limits"));
         }
         Ok(())
@@ -293,6 +287,8 @@ impl ApprovalStoreConfig {
 pub enum ApprovalError {
     #[error("invalid approval input: {0}")]
     Invalid(&'static str),
+    #[error("restored approval state requires explicit recovery commit")]
+    RecoveryRequired,
     #[error("approval request was not found")]
     NotFound,
     #[error("approval input conflicts with the durable request")]
@@ -311,14 +307,10 @@ pub enum ApprovalError {
     TargetBusy,
     #[error("approval storage capacity reached")]
     Capacity,
-    #[error("approval journal writer is already locked: {0}")]
-    Locked(std::io::Error),
-    #[error("approval journal is corrupt: {0}")]
+    #[error("invalid approval history: {0}")]
     Corrupt(String),
-    #[error("approval store is unavailable after an I/O failure")]
-    Unavailable,
-    #[error("approval storage I/O: {0}")]
-    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Commit(#[from] crate::operation::CommitError),
     #[error("approval JSON: {0}")]
     Json(#[from] serde_json::Error),
 }

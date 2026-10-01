@@ -1,9 +1,9 @@
 [package]
 name = "recuvora-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
-description = "Trusted recovery policy, approval and knowledge core for Recuvora"
+description = "Pure recovery policy, approval and knowledge decisions for Recuvora"
 publish = false
 autobins = false
 autotests = false
@@ -13,18 +13,9 @@ name = "recuvora_core"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-fs2 = "=0.4.3"
-
-[dev-dependencies]
-tokio = { version = "1.53.1", features = ["test-util", "fs"] }
-
-[target.'cfg(windows)'.dependencies]
-winapi-util = "=0.1.11"
-filepath = "=0.2.0"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -46,9 +37,5 @@ name = "recovery"
 path = "tests/recovery.rs"
 
 [[test]]
-name = "recovery_denial"
-path = "tests/recovery_denial.rs"
-
-[[test]]
-name = "target_ownership"
-path = "tests/target_ownership.rs"
+name = "commit"
+path = "tests/commit.rs"

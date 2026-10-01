@@ -2,7 +2,7 @@
 use super::{validation, *};
 use std::collections::BTreeSet;
 
-impl KnowledgeStore {
+impl KnowledgeState {
     /// Validates a bounded batch against the Host-bound source identity and local
     /// immutable versions. Inapplicable and quarantined proposals are excluded;
     /// malformed or conflicting evidence rejects the whole batch. No write occurs.

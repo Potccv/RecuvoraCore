@@ -1,6 +1,4 @@
 use super::*;
-use std::future::Future;
-use std::pin::Pin;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -33,7 +31,6 @@ pub struct RecoveryConfig {
     /// Minimum distinct incident episodes, never the number of abnormal samples.
     pub minimum_script_occurrences: u64,
     pub max_tasks: usize,
-    pub max_journal_bytes: u64,
 }
 
 impl RecoveryConfig {
@@ -59,7 +56,6 @@ impl RecoveryConfig {
             || !(1..=8).contains(&self.max_diagnoses)
             || !(1..=100_000).contains(&self.minimum_script_occurrences)
             || !(1..=10_000).contains(&self.max_tasks)
-            || !(4096..=128 * 1024 * 1024).contains(&self.max_journal_bytes)
             || self.target.allowed_languages.is_empty()
             || self.target.allowed_languages.len() > 3
             || self
@@ -211,7 +207,6 @@ pub enum RecoveryStage {
     AwaitingApproval,
     Executing,
     Verifying,
-    Publishing,
     Completed,
     Failed,
     Denied,
@@ -255,9 +250,10 @@ pub struct RecoveryTask {
     pub note: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    pub diagnosis_call: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BusinessVerification {
     pub operation_id: String,
@@ -300,83 +296,4 @@ pub struct ResultCheckRecord {
     pub execution: ExecutionResultCheck,
     /// Audit attribution supplied by the trusted caller, not authentication.
     pub actor: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct DiagnosisInput {
-    pub task: RecoveryTask,
-    pub config: RecoveryConfig,
-    pub observation: TargetObservation,
-    /// Applicable verified cases are evidence for a new plan, never authority.
-    pub knowledge: Vec<KnowledgeCandidate>,
-}
-#[derive(Clone, Debug)]
-pub struct ReviewInput {
-    pub request: approval::ApprovalRequest,
-    pub attempt: approval::ReviewAttempt,
-    pub observation: TargetObservation,
-    pub reused_script: bool,
-}
-#[derive(Clone, Debug)]
-pub struct ReviewOutput {
-    pub assessment: approval::ModelAssessment,
-    pub identity: approval::ReviewerIdentity,
-}
-#[derive(Clone, Debug)]
-pub struct VerificationInput {
-    pub target: TargetBinding,
-    pub operation: approval::ProposedOperation,
-    pub receipt: ScriptReceipt,
-}
-
-/// Only the workflow can construct this value, after persisting an execution intent.
-/// It cannot be cloned/deserialized and grants one dispatch to a trusted backend.
-pub struct AuthorizedScript<'a> {
-    pub(super) permit: &'a approval::ExecutionPermit,
-    pub(super) timeout_secs: u64,
-}
-impl AuthorizedScript<'_> {
-    pub fn operation(&self) -> &approval::ProposedOperation {
-        self.permit.operation()
-    }
-    pub fn request_id(&self) -> &str {
-        self.permit.request_id()
-    }
-    pub fn timeout_secs(&self) -> u64 {
-        self.timeout_secs
-    }
-}
-
-pub type RecoveryFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, RecoveryError>> + Send + 'a>>;
-
-/// Trusted integration boundary. Model output must never implement this interface.
-/// Methods must bound work, observe cancellation, and drain before returning;
-/// execute must report Unknown unless all executors are known to have stopped.
-pub trait RepairBackend: Send + Sync {
-    fn inspect<'a>(
-        &'a self,
-        target: &'a TargetBinding,
-        cancellation: Cancellation,
-    ) -> RecoveryFuture<'a, TargetObservation>;
-    fn diagnose(
-        &self,
-        input: DiagnosisInput,
-        cancellation: Cancellation,
-    ) -> RecoveryFuture<'_, RepairPlan>;
-    fn review(
-        &self,
-        input: ReviewInput,
-        cancellation: Cancellation,
-    ) -> RecoveryFuture<'_, ReviewOutput>;
-    fn execute<'a>(
-        &'a self,
-        script: AuthorizedScript<'a>,
-        cancellation: Cancellation,
-    ) -> RecoveryFuture<'a, ScriptReceipt>;
-    fn verify(
-        &self,
-        input: VerificationInput,
-        cancellation: Cancellation,
-    ) -> RecoveryFuture<'_, BusinessVerification>;
 }

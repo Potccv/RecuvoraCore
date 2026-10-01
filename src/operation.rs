@@ -1,176 +1,110 @@
-//! Cooperative cancellation and ownership of in-flight service calls.
-use std::collections::BTreeMap;
-use std::future::Future;
-use std::sync::{Arc, Mutex};
+//! Pure commit proposals. The trusted Host owns durable compare-and-swap.
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::watch;
 
-/// Shared, irreversible cancellation. Request cancellation, then await the
-/// original operation to observe cleanup and any unknown persistent outcome.
-#[derive(Clone, Debug)]
-pub struct Cancellation {
-    sender: watch::Sender<bool>,
+/// Exact logical transaction binding; this is domain data, not a storage format.
+/// Host scopes `id` and revision to the correct aggregate, atomically compares
+/// the prior revision and persists the complete proposal. Reusing an ID with
+/// different domain/input is a conflict, never a successful retry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitRequest {
+    pub id: String,
+    pub expected_revision: u64,
+    pub revision: u64,
+    pub domain: String,
+    pub input: serde_json::Value,
 }
-
-impl Cancellation {
-    pub fn new() -> Self {
-        let (sender, _) = watch::channel(false);
-        Self { sender }
-    }
-
-    pub fn cancel(&self) {
-        self.sender.send_replace(true);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        *self.sender.borrow()
-    }
-
-    pub async fn cancelled(&self) {
-        let mut receiver = self.sender.subscribe();
-        while !*receiver.borrow_and_update() {
-            let _ = receiver.changed().await;
+impl CommitRequest {
+    pub fn new(
+        id: String,
+        expected_revision: u64,
+        domain: String,
+        input: serde_json::Value,
+    ) -> Result<Self, CommitError> {
+        if !crate::identity::valid_id(&id) || !crate::identity::valid_id(&domain) {
+            return Err(CommitError::InvalidIdentity);
         }
-    }
-}
-
-impl Default for Cancellation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum DispatchError {
-    #[error("service is shutting down")]
-    Closed,
-    #[error("service call capacity exhausted")]
-    Capacity,
-    #[error("service call state lock was poisoned")]
-    Poisoned,
-    #[error("service call supervisor failed: {0}")]
-    Supervisor(String),
-}
-
-#[derive(Default)]
-struct Calls {
-    closed: bool,
-    next: u64,
-    active: BTreeMap<u64, Cancellation>,
-}
-
-struct SharedCalls {
-    state: Mutex<Calls>,
-    count: watch::Sender<usize>,
-}
-
-/// Bounded service dispatch with cooperative shutdown. The supervised future
-/// owns its slot even if its caller is dropped; shutdown waits for that future.
-/// This does not prove that a remote executor has stopped external effects.
-#[derive(Clone)]
-pub struct CallScope {
-    shared: Arc<SharedCalls>,
-}
-
-impl Default for CallScope {
-    fn default() -> Self {
-        Self {
-            shared: Arc::new(SharedCalls {
-                state: Mutex::new(Calls::default()),
-                count: watch::channel(0).0,
-            }),
-        }
-    }
-}
-
-impl CallScope {
-    pub async fn run<T: Send + 'static>(
-        &self,
-        cancellation: Cancellation,
-        operation: impl Future<Output = T> + Send + 'static,
-    ) -> Result<T, DispatchError> {
-        let id = {
-            let mut state = self
-                .shared
-                .state
-                .lock()
-                .map_err(|_| DispatchError::Poisoned)?;
-            if state.closed {
-                return Err(DispatchError::Closed);
-            }
-            if state.active.len() >= 1024 {
-                return Err(DispatchError::Capacity);
-            }
-            let id = state.next;
-            state.next = state.next.checked_add(1).ok_or(DispatchError::Capacity)?;
-            state.active.insert(id, cancellation.clone());
-            self.shared.count.send_replace(state.active.len());
-            id
-        };
-        let guard = ActiveCall {
-            shared: self.shared.clone(),
+        let revision = expected_revision
+            .checked_add(1)
+            .ok_or(CommitError::RevisionExhausted)?;
+        Ok(Self {
             id,
-        };
-        let mut caller = CancelOnDrop(Some(cancellation));
-        let task = tokio::spawn(async move {
-            let _guard = guard;
-            operation.await
-        });
-        let result = task
-            .await
-            .map_err(|error| DispatchError::Supervisor(error.to_string()));
-        if result.is_ok() {
-            caller.0 = None;
-        }
-        result
-    }
-
-    /// Synchronously revoke dispatch, including when no executor is available.
-    pub fn close(&self) -> Result<(), DispatchError> {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .map_err(|_| DispatchError::Poisoned)?;
-        state.closed = true;
-        for cancellation in state.active.values() {
-            cancellation.cancel();
-        }
-        Ok(())
-    }
-
-    /// Idempotently reject new calls and cancel existing calls before draining.
-    /// Dropping this future leaves the scope closed and allows a later retry.
-    pub async fn shutdown(&self) -> Result<(), DispatchError> {
-        let mut count = self.shared.count.subscribe();
-        self.close()?;
-        while *count.borrow_and_update() != 0 {
-            count.changed().await.map_err(|_| DispatchError::Poisoned)?;
-        }
-        Ok(())
+            expected_revision,
+            revision,
+            domain,
+            input,
+        })
     }
 }
 
-struct ActiveCall {
-    shared: Arc<SharedCalls>,
-    id: u64,
-}
-
-impl Drop for ActiveCall {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.shared.state.lock() {
-            state.active.remove(&self.id);
-            self.shared.count.send_replace(state.active.len());
-        }
+/// Trusted assertion that this exact proposal was durably committed.
+/// Not authentication; never expose this constructor to model tools. Confirming
+/// the same transaction twice must not release its effects twice. Host resolves
+/// uncertain commits from protected history and restores state without effects.
+#[derive(Debug)]
+pub struct CommitReceipt(CommitRequest);
+impl CommitReceipt {
+    pub fn confirmed(request: &CommitRequest) -> Self {
+        Self(request.clone())
     }
 }
 
-struct CancelOnDrop(Option<Cancellation>);
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CommitError {
+    #[error("invalid commit or domain identity")]
+    InvalidIdentity,
+    #[error("commit revision exhausted")]
+    RevisionExhausted,
+    #[error("receipt does not match the pending commit content")]
+    ReceiptMismatch,
+}
 
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        if let Some(cancellation) = &self.0 {
-            cancellation.cancel();
-        }
+/// Proposed state may be exported by Host. Effects are private until commit.
+/// Dropping a proposal never changes the input state. The bound input contains
+/// the complete prior logical state/configuration and transition input; it must
+/// not contain runtime handles or recursively embedded prior commit requests.
+#[derive(Debug)]
+pub struct Prepared<S, E = ()> {
+    request: CommitRequest,
+    state: S,
+    effects: Vec<E>,
+}
+impl<S, E> Prepared<S, E> {
+    pub fn new_bound(
+        id: String,
+        expected_revision: u64,
+        domain: String,
+        input: serde_json::Value,
+        state: S,
+        effects: Vec<E>,
+    ) -> Result<Self, CommitError> {
+        Ok(Self {
+            request: CommitRequest::new(id, expected_revision, domain, input)?,
+            state,
+            effects,
+        })
     }
+    pub fn request(&self) -> &CommitRequest {
+        &self.request
+    }
+    pub fn state(&self) -> &S {
+        &self.state
+    }
+    pub fn confirm(self, receipt: CommitReceipt) -> Result<Committed<S, E>, CommitError> {
+        if receipt.0 != self.request {
+            return Err(CommitError::ReceiptMismatch);
+        }
+        Ok(Committed {
+            state: self.state,
+            effects: self.effects,
+        })
+    }
+}
+/// Install after successful Host commit; dispatch effects at most once.
+/// Restart recovery must not reconstruct executable effects.
+#[derive(Debug)]
+pub struct Committed<S, E = ()> {
+    pub state: S,
+    pub effects: Vec<E>,
 }

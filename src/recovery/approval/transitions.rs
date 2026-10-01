@@ -1,15 +1,20 @@
 //! Pure validation of live and replayed approval state transitions.
 use super::*;
 
-impl ApprovalStore {
+impl ApprovalLedger {
     pub(super) fn apply(
         &self,
-        event: &Event,
+        event: &ApprovalEvent,
         now: u64,
         sequence: u64,
     ) -> Result<ApprovalRecord, ApprovalError> {
         let (id, change) = match event {
-            Event::Requested { request } => {
+            ApprovalEvent::Recover => {
+                return Err(ApprovalError::Invalid(
+                    "recovery is an aggregate transition",
+                ));
+            }
+            ApprovalEvent::Requested { request } => {
                 request.operation.validate()?;
                 request.policy.validate()?;
                 if self.records.len() >= self.config.max_requests {
@@ -57,7 +62,7 @@ impl ApprovalStore {
                     review_attempt: 0,
                 });
             }
-            Event::Changed { request_id, change } => (request_id, change),
+            ApprovalEvent::Changed { request_id, change } => (request_id, change),
         };
         let mut record = self.records.get(id).ok_or(ApprovalError::NotFound)?.clone();
         if now < record.updated_at {
@@ -65,7 +70,7 @@ impl ApprovalStore {
         }
         let state = record.state;
         match change {
-            Change::Assess { assessment } => {
+            ApprovalChange::Assess { assessment } => {
                 require_state(state, &[ApprovalState::Pending])?;
                 if record.review_stage != ReviewStage::ReadyHarness {
                     return Err(ApprovalError::Conflict);
@@ -85,7 +90,13 @@ impl ApprovalStore {
                 record.assessment = Some(assessment.clone());
                 finish_review(&mut record);
             }
-            Change::HumanDecision { assessment } => {
+            ApprovalChange::HumanDecision {
+                expected_revision,
+                assessment,
+            } => {
+                if record.revision != *expected_revision {
+                    return Err(ApprovalError::Conflict);
+                }
                 require_state(
                     state,
                     &[ApprovalState::Pending, ApprovalState::WaitingHuman],
@@ -99,7 +110,7 @@ impl ApprovalStore {
                 record.assessment = Some(assessment.clone());
                 finish_review(&mut record);
             }
-            Change::BeginReview {
+            ApprovalChange::BeginReview {
                 expected_revision,
                 timeout_secs,
             } => {
@@ -142,7 +153,7 @@ impl ApprovalStore {
                 record.state = ApprovalState::Pending;
                 record.note = Some("independent harness review started".into());
             }
-            Change::AssessAttempt {
+            ApprovalChange::AssessAttempt {
                 attempt,
                 assessment,
             } => {
@@ -160,7 +171,7 @@ impl ApprovalStore {
                 record.assessment = Some(assessment.clone());
                 finish_review(&mut record);
             }
-            Change::FailReview { attempt, reason } => {
+            ApprovalChange::FailReview { attempt, reason } => {
                 validate_attempt(&record, attempt)?;
                 fresh(&record, now)?;
                 text(reason, MAX_REASON)?;
@@ -168,7 +179,7 @@ impl ApprovalStore {
                 record.review_stage = ReviewStage::NeedsHuman;
                 record.note = Some(reason.clone());
             }
-            Change::Revoke { reason } | Change::Cancel { reason } => {
+            ApprovalChange::Revoke { reason } | ApprovalChange::Cancel { reason } => {
                 text(reason, MAX_REASON)?;
                 require_state(
                     state,
@@ -181,7 +192,7 @@ impl ApprovalStore {
                 )?;
                 record.state = if state == ApprovalState::Executing {
                     ApprovalState::Unknown
-                } else if matches!(change, Change::Revoke { .. }) {
+                } else if matches!(change, ApprovalChange::Revoke { .. }) {
                     ApprovalState::Revoked
                 } else {
                     ApprovalState::Canceled
@@ -189,7 +200,7 @@ impl ApprovalStore {
                 record.note = Some(reason.clone());
                 record.review_stage = ReviewStage::Finished;
             }
-            Change::WaitingHuman { reason } => {
+            ApprovalChange::WaitingHuman { reason } => {
                 require_state(state, &[ApprovalState::Pending])?;
                 fresh(&record, now)?;
                 text(reason, MAX_REASON)?;
@@ -197,7 +208,7 @@ impl ApprovalStore {
                 record.note = Some(reason.clone());
                 record.review_stage = ReviewStage::NeedsHuman;
             }
-            Change::Expire => {
+            ApprovalChange::Expire => {
                 require_state(
                     state,
                     &[
@@ -212,7 +223,7 @@ impl ApprovalStore {
                 record.state = ApprovalState::Expired;
                 record.review_stage = ReviewStage::Finished;
             }
-            Change::Consume => {
+            ApprovalChange::Consume => {
                 require_state(state, &[ApprovalState::Approved])?;
                 fresh(&record, now)?;
                 if !record.request.policy.allows(&record.request.operation) {
@@ -229,18 +240,18 @@ impl ApprovalStore {
                 }
                 record.state = ApprovalState::Executing;
             }
-            Change::Complete { outcome, reason } => {
+            ApprovalChange::Complete { outcome, reason } => {
                 require_state(state, &[ApprovalState::Executing])?;
                 text(reason, MAX_REASON)?;
                 record.state = outcome_state(*outcome);
                 record.note = Some(reason.clone());
             }
-            Change::RecoverUnknown => {
+            ApprovalChange::RecoverUnknown => {
                 require_state(state, &[ApprovalState::Executing])?;
                 record.state = ApprovalState::Unknown;
                 record.note = Some("host restarted with an unconfirmed execution intent".into());
             }
-            Change::Reconcile {
+            ApprovalChange::Reconcile {
                 outcome,
                 reason,
                 actor,

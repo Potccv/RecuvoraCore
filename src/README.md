@@ -1,12 +1,10 @@
 # 核心源码
 
-[lib.rs](lib.rs) 公开 `operation` 与 `recovery` 两个模块。本页是公开模块的源码导航；项目职责见[架构](../docs/architecture.md)。
+[lib.rs](lib.rs) 只公开 `operation` 和 `recovery`，职责见[架构](../docs/architecture.md)。
 
-| 公开模块 | 职责与入口 |
+| 模块 | 入口与职责 |
 | --- | --- |
-| `operation` | [调用取消与监督](operation.rs)，供异步业务端口共用，支持取消并等待当前任务结束；不装配应用生命周期 |
-| `recovery` | [恢复领域](recovery/README.md)，组织故障、审批、知识库与恢复编排 |
+| `operation` | [提交提案](operation.rs)：`Prepared`、绑定完整输入的 `CommitRequest`、可信提交回执及确认后效果 |
+| `recovery` | [恢复领域](recovery/README.md)：故障、审批、知识和恢复流程的纯逻辑 |
 
-[identity.rs](identity.rs) 是私有实现，提供本库的有界标识校验和调用关联 ID。它不是认证服务、目标归属权威或跨进程 ID 规范；调用方通过公开领域类型表达这些关系。
-
-开发规则见[源码规范](AGENTS.md)，各域规则沿目录继续继承。
+[identity.rs](identity.rs) 仅提供私有有界标识校验，不生成系统时间或进程相关身份，也不证明认证和目标归属。规则见[源码规范](AGENTS.md)。

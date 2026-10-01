@@ -1,42 +1,31 @@
-# 持久恢复流程
+# 恢复状态机实现
 
-`RecoveryService` 组合故障、审批与知识库，为一个配置目标维护恢复决策和持久任务。可信 Host 主动推进流程并实现实际检查、诊断、审核、执行和验收端口；本目录不装配这些服务。
+`RecoveryState` 为一个逻辑目标计算恢复任务，不持有文件、时钟、后端、所有权锁或异步任务。公开入口由 `recovery::workflow` 导出。
 
 | 文件 | 职责 |
 | --- | --- |
-| [contract.rs](contract.rs) | 领域配置、任务、方案、执行/验收证据及 `RepairBackend` |
-| [engine.rs](engine.rs) | 决策状态机与跨域持久提交 |
-| [incident_gate.rs](incident_gate.rs) | 当前权威故障的同步复查接口 |
-| [ownership.rs](ownership.rs) | 规范目标身份、所有权端口与本地持久提供方 |
-| [storage.rs](storage.rs) | 有界单写入者任务日志及重放校验 |
-| [storage_paths.rs](storage_paths.rs) | 日志路径与打开文件身份检查 |
-| [migration.rs](migration.rs) | 纯字节的完整历史校验与显式迁移 |
-| [query.rs](query.rs) | 不含方案或脚本文本的有界查询与容量概览 |
+| [contract.rs](contract.rs) | 配置、任务、方案、执行与独立业务验收证据 |
+| [engine.rs](engine.rs) | 命令、历史事件、提交提案、流程迁移与经验待交付记录 |
+| [query.rs](query.rs) | `RecoveryTaskSummary` 与 `RecoveryNextStep` 结构化进度 |
 
-## 调用方与配置
+## 使用与提交
 
-`open` 和 `open_with_clock` 使用默认审批与知识库容量；`open_with_store_configs` 和 `open_with_clock_and_store_configs` 接受显式 `ApprovalStoreConfig` 与 `KnowledgeStoreConfig`，时钟版本还接受可信 `RecoveryClock`。这些入口都校验 `RecoveryConfig`，状态目录须位于源码外。容量字段由[审批域](../../approval/README.md)和[知识库域](../../knowledge/README.md)维护，恢复流程配置迁移见[领域维护](../../../../docs/domain-maintenance.md)。
+`new(config)` 创建空状态；`prepare(commit_id, command, now_ms, knowledge)` 返回 `Prepared<RecoveryState, RecoveryEffect>`。准备不修改原状态，`state()` 只读访问拟提交状态；Host 持久保存新增 `RecoveryEntry` 及提交身份，原子比较聚合版本后调用 `confirm`，再安装结果并处理返回效果。请求绑定配置、先前领域状态、完整事件与时间。
 
-打开存储只启用恢复与查询。调用方还须绑定目标所有权和权威故障端口；共享规范目标的所有权不能因状态目录不同或异常退出而被绕过。端口绑定、独立故障轮次、日志格式与离线维护规则见[领域维护](../../../../docs/domain-maintenance.md)。
+`RecoveryCommand::Event` 输入普通领域事件。实际执行使用 `RecoveryCommand::AuthorizeExecution`，要求持有审批域确认消费后返回的 `ExecutionPermit`；相应 `RecoveryEffect::Execute` 在流程提交确认后交还该一次许可。直接提交 `ExecutionAuthorized` 事件不能获取执行资格。Host 必须维持目标所有权及当前故障条件，不能把 `TargetAuthority` 数据结构当成分布式锁。
 
-恢复流程阶段不授予权限：审核、一次许可、执行结果和业务验收分别由其权威记录决定。审批恢复不自动派发，未知执行结果（`Unknown`）不自动重放；修复经验交付失败仅重试交付。重新诊断只适用于流程允许的复用失败，不是所有明确失败的通用重试。具体阶段、审批关联恢复、显式恢复及失败处理见[恢复流程](../../../../docs/recovery.md)。
+Host 执行诊断、审批接入、动作和验收；返回事件必须绑定提交后的任务版本、调用或操作身份。诊断效果携带超时和工具预算，Host 负责真正实施这些限制。观察、验收和结果核实证据接受最多 30 秒的新鲜度窗口；Unix 毫秒时间由可信调用方显式传入。
 
-`bind_knowledge_source` 可绑定一个 Host 聚合后的知识库来源，并在绑定时固定其逻辑身份；同一运行期只允许绑定一次，重开恢复流程后重新绑定。来源返回错误或候选批次被拒绝时，流程保存有界原因并继续本地诊断；取消仍按调用取消处理。外部修复经验只参与诊断，来源与候选校验由[知识库域](../../knowledge/README.md)定义。
+## 恢复与查询
 
-实际服务路由、脚本执行和业务验收属于可信嵌入方，验证范围见[实现状态](../../../../docs/implementation-status.md)。开发规则见[恢复流程规范](AGENTS.md)。
+`entries()` 返回可序列化的领域历史；`restore(config, entries)` 重复实时验证并拒绝顺序、身份、内容或迁移不一致，不返回任何执行效果。恢复后 `recovery_required()` 为 true，必须先提交 `Recover`。审批等待转为 `Paused` 并要求显式 `Resume`；中断执行转 Unknown 并保存版本隔离；诊断次数不退还，旧回调失效。Host 在恢复或取消前处理旧调用的停止与资源归属。
 
-## 查询摘要
+`task`、`tasks` 返回只读领域状态；`RecoveryTaskSummary::from` 给出阶段、下一步、版本及原因，不产生授权。任务登记区分独立故障轮次与异常样本数，未结束任务阻塞同目标新任务，重复故障身份返回原轮次。
 
-`inspect_tasks(&RecoveryQuery)` 按任务 ID 升序分页，`after_id` 返回严格晚于该 ID 的任务，一页为 1..=100 条。阶段过滤允许空集合或最多 12 个不重复阶段。`RecoveryTaskSummary` 返回任务/故障/目标身份、记录版本号（`revision`）、阶段、异常观察样本数与独立故障轮次数、诊断次数、审批/操作引用和时间，不包含方案、脚本文本或完整证据。
+## 经验交付
 
-`overview` 核验任务日志仍对应已持有的文件身份与长度后，返回任务数量与限额、日志字节与限额、各阶段数量和 `Unknown` 审批数量。查询只返回领域记录的只读查询结果，不改变审批、许可、执行或验收事实；调用方的认证与展示转换由 Host 负责。
+业务成功或明确失败后即确定任务结果，同时在同一提案中建立稳定 `KnowledgeDelivery`。失败和 Unknown 的脚本版本同步进入流程本地隔离集合，知识模块暂时不可用也不能再次执行该版本。
 
-## 公开接口与持久记录
+`pending_deliveries()` 返回尚未确认的经验交付数据，Host 可幂等重试；知识模块确认提交后才输入 `DeliveryConfirmed`。交付重试不重新诊断或执行。历史 Unknown 的隔离在后来验收成功后仍保留。交付顺序、重放与跨域恢复细节见[恢复流程](../../../../docs/recovery.md)和[领域维护](../../../../docs/domain-maintenance.md)。
 
-公开入口为 `recuvora_core::recovery::workflow`，导出 `RecoveryService`、`RecoveryConfig`、`RecoveryTask`、`RecoveryStage`、`RecoveryError` 及查询和日志维护接口。`RecoveryClock` 接受可信时钟实现，`SystemRecoveryClock` 提供系统时钟，`RecoveryFuture` 表达异步业务调用。
-
-`RecoveryService::check_result` 核实未知执行结果，分别接受绑定原操作的 `ExecutionResultCheck` 和独立 `BusinessVerification`。执行证据包含操作、目标、执行器、执行者停止状态、证据引用与 `checked_at_ms` 时间；`CheckedExecution` 表达核实结论，不能根据目标当前健康状态推断执行结果或续发许可。
-
-`RecoveryTask.result_check` 保存已接受的 `ResultCheckRecord`，包含独立执行证据和可信调用方的审计归属。`ExecutionResultCheck.checked_at_ms` 保存核实证据的 Unix 毫秒时间。字段和持久 JSON 均按当前数据结构校验，未知字段拒绝读取。
-
-可信所有权实现必须提供 `TargetLease::recovery_directory`，返回绑定的规范存储目录，并保持独占、校验和显式释放语义。任务存储使用 `recovery.jsonl` 和 `recovery.lock`；目标所有权绑定存储目录及锁文件对象身份。发现不支持的存储文件时，拒绝打开任务存储或取得目标所有权，不创建新的任务日志或锁文件。日志格式、配置版本和恢复约束见[领域维护](../../../../docs/domain-maintenance.md)。
+规则见[AGENTS](AGENTS.md)。

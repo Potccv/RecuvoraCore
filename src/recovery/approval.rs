@@ -1,32 +1,29 @@
-//! Trusted, durable approval decisions, separate from simulation authorization.
+//! Pure approval decisions and commit-gated execution capabilities.
 //!
 //! Callers are trusted host code: this is not an authentication boundary against
 //! arbitrary code in the host process. Model output is evidence, never a permit.
 
 mod contract;
-mod execution;
-mod paths;
-mod requests;
-mod storage;
+mod ledger;
 mod transitions;
 
+use crate::operation::Prepared;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs::File, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 const MAX_ID: usize = 512;
 const MAX_REASON: usize = 8192;
 const MAX_ACTION: usize = 131_072;
-const MAX_RECORD: usize = 262_144;
 
 pub use contract::{
-    ApprovalAssessment, ApprovalDecision, ApprovalError, ApprovalPolicy, ApprovalRecord,
-    ApprovalRequest, ApprovalState, ApprovalStoreConfig, AssessmentSource, ExecutionOutcome,
+    ApprovalAssessment, ApprovalDecision, ApprovalError, ApprovalLimits, ApprovalPolicy,
+    ApprovalRecord, ApprovalRequest, ApprovalState, AssessmentSource, ExecutionOutcome,
     ModelAssessment, ProposedOperation, ReviewAttempt, ReviewStage, ReviewerConfig,
     ReviewerIdentity,
 };
 
 /// A one-use, non-cloneable capability produced only after the execution intent
-/// was synced. It does not implement Deserialize and its fields are private.
+/// was confirmed by the trusted Host. It does not implement Deserialize and its fields are private.
 #[derive(Debug)]
 pub struct ExecutionPermit {
     request_id: String,
@@ -39,34 +36,45 @@ impl ExecutionPermit {
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
     pub fn operation(&self) -> &ProposedOperation {
         &self.operation
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct JournalEntry {
-    format: u32,
-    sequence: u64,
-    now: u64,
-    event: Event,
+pub struct ApprovalEntry {
+    pub commit_id: String,
+    pub sequence: u64,
+    pub now: u64,
+    pub event: ApprovalEvent,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
-enum Event {
-    Requested { request: ApprovalRequest },
-    Changed { request_id: String, change: Change },
+pub enum ApprovalEvent {
+    /// Explicit Host restart recovery; never dispatches a stored intent.
+    Recover,
+    Requested {
+        request: ApprovalRequest,
+    },
+    Changed {
+        request_id: String,
+        change: ApprovalChange,
+    },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "change", rename_all = "snake_case", deny_unknown_fields)]
-enum Change {
+pub enum ApprovalChange {
     Assess {
         assessment: ApprovalAssessment,
     },
     HumanDecision {
+        expected_revision: u64,
         assessment: ApprovalAssessment,
     },
     BeginReview {
@@ -104,74 +112,27 @@ enum Change {
     },
 }
 
-/// A synchronous single-writer store. No external call is made while changing
-/// state. Keep it in trusted host code and serialize its short local operations.
-pub struct ApprovalStore {
-    file: File,
-    journal_path: PathBuf,
-    _lock: File,
-    lock_path: PathBuf,
-    config: ApprovalStoreConfig,
+/// Pure approval aggregate. Host atomically commits its history and aggregate revision.
+/// Restoring history produces no executable effects.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalLedger {
+    config: ApprovalLimits,
+    #[serde(skip)]
+    recovery_required: bool,
+    #[serde(skip)]
     sequence: u64,
-    bytes: u64,
-    poisoned: bool,
+    #[serde(skip)]
     records: BTreeMap<String, ApprovalRecord>,
+    history: Vec<ApprovalEntry>,
+    #[serde(skip)]
     identity: Arc<()>,
 }
 
-impl ApprovalStore {
-    fn check_current(
-        &mut self,
-        id: &str,
-        policy: &ApprovalPolicy,
-        now: u64,
-    ) -> Result<(), ApprovalError> {
-        self.available()?;
-        policy.validate()?;
-        let record = self.records.get(id).ok_or(ApprovalError::NotFound)?;
-        if &record.request.policy != policy {
-            return Err(ApprovalError::Conflict);
-        }
-        if now < record.updated_at {
-            return Err(ApprovalError::Invalid("clock moved backwards"));
-        }
-        if now >= record.request.expires_at
-            && matches!(
-                record.state,
-                ApprovalState::Pending | ApprovalState::WaitingHuman | ApprovalState::Approved
-            )
-        {
-            self.change(id, Change::Expire, now)?;
-            return Err(ApprovalError::Expired);
-        }
-        if record.state == ApprovalState::Expired {
-            return Err(ApprovalError::Expired);
-        }
-        Ok(())
-    }
-
-    fn available(&self) -> Result<(), ApprovalError> {
-        if self.poisoned {
-            Err(ApprovalError::Unavailable)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn change(
-        &mut self,
-        id: &str,
-        change: Change,
-        now: u64,
-    ) -> Result<ApprovalRecord, ApprovalError> {
-        self.append(
-            Event::Changed {
-                request_id: id.into(),
-                change,
-            },
-            now,
-        )
-    }
+/// Released only after the Host confirms a successful durable commit.
+#[derive(Debug)]
+pub enum ApprovalEffect {
+    Execute(ExecutionPermit),
+    Review(ReviewAttempt),
 }
 
 fn text(value: &str, maximum: usize) -> Result<(), ApprovalError> {
@@ -183,10 +144,3 @@ fn text(value: &str, maximum: usize) -> Result<(), ApprovalError> {
         Ok(())
     }
 }
-
-#[cfg(test)]
-use paths::validate_external_dir_for_source;
-
-#[cfg(test)]
-#[path = "../../tests/approval_paths.rs"]
-mod path_tests;

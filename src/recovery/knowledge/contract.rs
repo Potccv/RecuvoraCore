@@ -1,7 +1,6 @@
 //! Public proposals, exact retrieval predicates and trusted verification attestations.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::{future::Future, pin::Pin};
 use thiserror::Error;
 
 pub const MAX_SCRIPT_BYTES: usize = 32 * 1024;
@@ -15,20 +14,6 @@ pub struct KnowledgeProposal {
     pub source_id: String,
     pub candidate: KnowledgeCandidate,
     pub evidence_refs: Vec<String>,
-}
-
-pub type KnowledgeFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<KnowledgeProposal>, KnowledgeError>> + Send + 'a>>;
-
-/// Host owns source routing and aggregation. Core bounds and checks the returned
-/// proposals; adapters must also bound transport allocation and honor cancellation.
-pub trait KnowledgeSource: Send + Sync {
-    fn identity(&self) -> &str;
-    fn query(
-        &self,
-        query: KnowledgeQuery,
-        cancellation: crate::operation::Cancellation,
-    ) -> KnowledgeFuture<'_>;
 }
 
 /// Immutable content for one `(id, version)`. No interpreter is run by this module.
@@ -111,7 +96,7 @@ pub struct BusinessVerificationRecord {
 /// business checks. This type deliberately has no `Deserialize` implementation.
 /// It is not authentication or a proof of evidence truth; the application must bind
 /// its verifier identity, persist the verification evidence and restrict this API.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TrustedBusinessVerification(pub(super) BusinessVerificationRecord);
 
 impl TrustedBusinessVerification {
@@ -212,62 +197,36 @@ pub struct KnowledgeStatusCounts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct KnowledgeStoreProjection {
+pub struct KnowledgeProjection {
     pub records: usize,
     pub scripts: usize,
     pub cases: usize,
     pub quarantined_versions: usize,
     pub statuses: KnowledgeStatusCounts,
-    pub journal_bytes: u64,
-    pub max_journal_bytes: u64,
     pub max_records: usize,
     pub max_cases_per_record: usize,
-    pub writable: bool,
-}
-
-/// A complete, validated checkpoint for Host-managed offline replacement. It
-/// cannot be deserialized as a trusted plan; writing it never changes this store.
-#[derive(Clone, Debug)]
-pub struct CompactJournal {
-    pub source_sequence: u64,
-    pub source_bytes: u64,
-    pub compacted_bytes: u64,
-    pub records: usize,
-    pub scripts: usize,
-    pub cases: usize,
-    pub quarantined_versions: usize,
-    pub(super) bytes: Vec<u8>,
-}
-
-impl CompactJournal {
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct KnowledgeStoreConfig {
+pub struct KnowledgeConfig {
     pub max_records: usize,
     pub max_cases_per_record: usize,
-    pub max_journal_bytes: u64,
 }
 
-impl Default for KnowledgeStoreConfig {
+impl Default for KnowledgeConfig {
     fn default() -> Self {
         Self {
             max_records: 1024,
             max_cases_per_record: 128,
-            max_journal_bytes: 64 * 1024 * 1024,
         }
     }
 }
 
-impl KnowledgeStoreConfig {
+impl KnowledgeConfig {
     pub fn validate(&self) -> Result<(), KnowledgeError> {
         if !(1..=100_000).contains(&self.max_records)
             || !(1..=1024).contains(&self.max_cases_per_record)
-            || !(1..=1024 * 1024 * 1024).contains(&self.max_journal_bytes)
         {
             return Err(KnowledgeError::Invalid("store limits out of range".into()));
         }
@@ -285,10 +244,40 @@ pub enum KnowledgeError {
     NotFound(String),
     #[error("knowledge capacity exhausted: {0}")]
     Capacity(String),
-    #[error("corrupt knowledge journal: {0}")]
-    Corrupt(String),
-    #[error("knowledge store unavailable: {0}")]
-    Unavailable(String),
-    #[error("knowledge I/O: {0}")]
-    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Commit(#[from] crate::operation::CommitError),
+}
+
+/// Trusted Host inputs. This enum deliberately cannot be deserialized into authority.
+#[derive(Clone, Debug, Serialize)]
+pub enum KnowledgeCommand {
+    UpsertCandidate(KnowledgeCandidate),
+    RecordOutcome {
+        record_id: String,
+        case: RepairCase,
+        verification: Option<TrustedBusinessVerification>,
+    },
+    Disable {
+        record_id: String,
+        expected_revision: u64,
+        actor: String,
+        reason: String,
+    },
+}
+
+/// Host supplies a confirmed historical transaction and reconstructs any trusted
+/// business assertion only from its protected authoritative records.
+pub struct KnowledgeReplayEntry {
+    pub request: crate::operation::CommitRequest,
+    pub command: KnowledgeCommand,
+    pub receipt: crate::operation::CommitReceipt,
+}
+
+/// Complete data export for Host transport and queries, not installable authority.
+/// Immutable scripts and all case/disablement facts are retained inside records.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct KnowledgeSnapshot {
+    pub revision: u64,
+    pub config: KnowledgeConfig,
+    pub records: Vec<KnowledgeRecord>,
 }

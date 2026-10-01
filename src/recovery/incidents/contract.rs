@@ -86,27 +86,23 @@ pub struct MonitorCommit {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct IncidentStoreConfig {
+pub struct IncidentLimits {
     pub max_incidents: usize,
     pub max_monitors: usize,
-    pub max_journal_bytes: u64,
 }
 
-impl Default for IncidentStoreConfig {
+impl Default for IncidentLimits {
     fn default() -> Self {
         Self {
             max_incidents: 10_000,
             max_monitors: 256,
-            max_journal_bytes: 64 * 1024 * 1024,
         }
     }
 }
 
-impl IncidentStoreConfig {
+impl IncidentLimits {
     pub fn validate(&self) -> Result<(), IncidentError> {
-        if !(1..=100_000).contains(&self.max_incidents)
-            || !(1..=4096).contains(&self.max_monitors)
-            || !(1..=1024 * 1024 * 1024).contains(&self.max_journal_bytes)
+        if !(1..=100_000).contains(&self.max_incidents) || !(1..=4096).contains(&self.max_monitors)
         {
             return Err(IncidentError::Invalid("store limits out of range".into()));
         }
@@ -126,8 +122,6 @@ pub enum IncidentError {
     Capacity(String),
     #[error("corrupt incident journal: {0}")]
     Corrupt(String),
-    #[error("incident storage I/O: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("incident storage unavailable: {0}")]
-    Unavailable(String),
+    #[error(transparent)]
+    Commit(#[from] crate::operation::CommitError),
 }
