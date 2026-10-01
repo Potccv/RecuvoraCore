@@ -5,15 +5,21 @@
 
 mod contract;
 mod ledger;
+mod legacy;
 mod transitions;
 
 use crate::operation::Prepared;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 const MAX_ID: usize = 512;
 const MAX_REASON: usize = 8192;
 const MAX_ACTION: usize = 131_072;
+
+pub use legacy::{
+    ApprovalImport, ApprovalImportData, LegacyApprovalEntry, LegacyExecutionUncertainty,
+    LegacyUncertaintyData,
+};
 
 pub use contract::{
     ApprovalAssessment, ApprovalDecision, ApprovalError, ApprovalLimits, ApprovalPolicy,
@@ -47,6 +53,7 @@ impl ExecutionPermit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalEntry {
+    pub prior_digest: String,
     pub commit_id: String,
     pub sequence: u64,
     pub now: u64,
@@ -56,6 +63,14 @@ pub struct ApprovalEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalEvent {
+    /// Validated complete historical import; only the dedicated capability API prepares it.
+    Imported {
+        history: ApprovalImportData,
+    },
+    /// Preserves uncertain old intent without fabricating a consumed permit.
+    OriginalAuthorityUncertain {
+        proof: LegacyUncertaintyData,
+    },
     /// Explicit Host restart recovery; never dispatches a stored intent.
     Recover,
     Requested {
@@ -70,6 +85,7 @@ pub enum ApprovalEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "change", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalChange {
+    /// Rejected in live and replay validation; use BeginReview / AssessAttempt.
     Assess {
         assessment: ApprovalAssessment,
     },
@@ -116,14 +132,18 @@ pub enum ApprovalChange {
 /// Restoring history produces no executable effects.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApprovalLedger {
+    #[serde(skip)]
+    digest: String,
+    #[serde(skip)]
+    commit_ids: im::OrdSet<String>,
     config: ApprovalLimits,
     #[serde(skip)]
     recovery_required: bool,
     #[serde(skip)]
     sequence: u64,
     #[serde(skip)]
-    records: BTreeMap<String, ApprovalRecord>,
-    history: Vec<ApprovalEntry>,
+    records: crate::collections::Map<String, ApprovalRecord>,
+    history: im::Vector<std::sync::Arc<ApprovalEntry>>,
     #[serde(skip)]
     identity: Arc<()>,
 }

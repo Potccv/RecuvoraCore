@@ -23,4 +23,6 @@
 
 Core 保留硬政策、审核身份和期限、一次执行许可、故障轮次、同目标流程互斥、Unknown 核实、精确知识检索及永久版本隔离。重放历史不会返回执行许可或外部操作；经验交付失败不会重跑修复。具体流程见[恢复流程](docs/recovery.md)，当前验证及限制见[实现状态](docs/implementation-status.md)。
 
+提交使用增量历史绑定，Harness 审核必须关联已提交尝试，知识容量支持受校验扩容，外部候选支持确定性重复接入。CORE-001 至 CORE-004 的处理状态和规模验证见[已知问题](docs/implementation-status.md#已知问题)。
+
 开发遵循 [AGENTS](AGENTS.md) 和[开发指南](docs/development.md)。完整入口见[文档导航](docs/README.md)。

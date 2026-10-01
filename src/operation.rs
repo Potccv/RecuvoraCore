@@ -62,8 +62,8 @@ pub enum CommitError {
 
 /// Proposed state may be exported by Host. Effects are private until commit.
 /// Dropping a proposal never changes the input state. The bound input contains
-/// the complete prior logical state/configuration and transition input; it must
-/// not contain runtime handles or recursively embedded prior commit requests.
+/// a versioned commitment to prior configuration/history and the complete new
+/// transition input; it must not recursively embed prior commit requests.
 #[derive(Debug)]
 pub struct Prepared<S, E = ()> {
     request: CommitRequest,

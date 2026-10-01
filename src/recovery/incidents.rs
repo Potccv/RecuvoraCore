@@ -6,7 +6,6 @@ mod validation;
 
 use crate::operation::Prepared;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 const MAX_CHECKPOINT_BYTES: usize = 131_072;
 const MAX_EVIDENCE_BYTES: usize = 16_384;
@@ -37,6 +36,7 @@ pub enum IncidentEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IncidentEntry {
+    pub prior_digest: String,
     pub commit_id: String,
     pub sequence: u64,
     pub event: IncidentEvent,
@@ -56,16 +56,20 @@ struct MonitorState {
 /// Pure incident aggregate; Host owns durable storage and atomic revision checks.
 #[derive(Debug, Clone, Serialize)]
 pub struct IncidentLedger {
+    #[serde(skip)]
+    digest: String,
+    #[serde(skip)]
+    commit_ids: im::OrdSet<String>,
     config: IncidentLimits,
     #[serde(skip)]
     sequence: u64,
-    history: Vec<IncidentEntry>,
+    history: im::Vector<std::sync::Arc<IncidentEntry>>,
     #[serde(skip)]
-    records: BTreeMap<String, IncidentRecord>,
+    records: crate::collections::Map<String, IncidentRecord>,
     #[serde(skip)]
-    active: BTreeMap<IncidentKey, String>,
+    active: crate::collections::Map<IncidentKey, String>,
     #[serde(skip)]
-    monitors: BTreeMap<String, MonitorState>,
+    monitors: crate::collections::Map<String, MonitorState>,
 }
 
 impl IncidentLedger {

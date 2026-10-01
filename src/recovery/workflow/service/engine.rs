@@ -38,6 +38,9 @@ pub struct KnowledgeDelivery {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RecoveryEvent {
+    LegacyImported {
+        data: RecoveryImportData,
+    },
     Register {
         problem: ProblemContext,
         incident: IncidentEvidence,
@@ -124,6 +127,7 @@ pub enum RecoveryEvent {
 }
 
 pub enum RecoveryCommand {
+    Import(RecoveryImport),
     Event(RecoveryEvent),
     AuthorizeExecution {
         task_id: String,
@@ -174,15 +178,18 @@ pub struct RecoveryEntry {
 /// No unchecked Deserialize implementation and no ambient clock or I/O.
 #[derive(Clone, Debug)]
 pub struct RecoveryState {
+    digest: String,
+    commit_ids: im::OrdSet<String>,
     config: RecoveryConfig,
     revision: u64,
     updated_at_ms: u64,
-    tasks: BTreeMap<String, RecoveryTask>,
-    deliveries: BTreeMap<String, KnowledgeDelivery>,
-    quarantined: BTreeSet<(String, u64)>,
-    scripts: BTreeMap<(String, u64), ScriptArtifact>,
-    candidates: BTreeMap<String, KnowledgeCandidate>,
-    entries: Vec<RecoveryEntry>,
+    tasks: crate::collections::Map<String, RecoveryTask>,
+    deliveries: crate::collections::Map<String, KnowledgeDelivery>,
+    legacy_delivery_order: im::OrdMap<String, u64>,
+    quarantined: im::OrdSet<(String, u64)>,
+    scripts: crate::collections::Map<(String, u64), ScriptArtifact>,
+    candidates: crate::collections::Map<String, KnowledgeCandidate>,
+    entries: im::Vector<std::sync::Arc<RecoveryEntry>>,
     recovery_required: bool,
 }
 
@@ -190,15 +197,18 @@ impl RecoveryState {
     pub fn new(config: RecoveryConfig) -> Result<Self, RecoveryError> {
         config.validate()?;
         Ok(Self {
+            digest: crate::binding::digest(&("recovery", &config)),
+            commit_ids: im::OrdSet::new(),
             config,
             revision: 0,
             updated_at_ms: 0,
-            tasks: BTreeMap::new(),
-            deliveries: BTreeMap::new(),
-            quarantined: BTreeSet::new(),
-            scripts: BTreeMap::new(),
-            candidates: BTreeMap::new(),
-            entries: Vec::new(),
+            tasks: crate::collections::Map::new(),
+            deliveries: crate::collections::Map::new(),
+            legacy_delivery_order: im::OrdMap::new(),
+            quarantined: im::OrdSet::new(),
+            scripts: crate::collections::Map::new(),
+            candidates: crate::collections::Map::new(),
+            entries: im::Vector::new(),
             recovery_required: false,
         })
     }
@@ -214,8 +224,17 @@ impl RecoveryState {
     pub fn revision(&self) -> u64 {
         self.revision
     }
-    pub fn entries(&self) -> &[RecoveryEntry] {
-        &self.entries
+    /// Copies the complete history for export; use latest_entry for incremental persistence.
+    pub fn entries(&self) -> Vec<RecoveryEntry> {
+        self.entries
+            .iter()
+            .map(|entry| entry.as_ref().clone())
+            .collect()
+    }
+
+    /// The newest validated entry, without copying the history.
+    pub fn latest_entry(&self) -> Option<&RecoveryEntry> {
+        self.entries.back().map(AsRef::as_ref)
     }
     pub fn task(&self, id: &str) -> Option<&RecoveryTask> {
         self.tasks.get(id)
@@ -227,7 +246,16 @@ impl RecoveryState {
             .filter(|d| !d.delivered)
             .cloned()
             .collect();
-        deliveries.sort_by_key(|delivery| (delivery.created_revision, delivery.id.clone()));
+        deliveries.sort_by_key(|delivery| {
+            (
+                delivery.created_revision,
+                self.legacy_delivery_order
+                    .get(&delivery.id)
+                    .copied()
+                    .unwrap_or(0),
+                delivery.id.clone(),
+            )
+        });
         deliveries
     }
     pub fn is_quarantined(&self, id: &str, version: u64) -> bool {
@@ -251,8 +279,20 @@ impl RecoveryState {
             ));
         }
         let (event, permit) = match command {
+            RecoveryCommand::Import(import) => {
+                if !import.execution_uncertainties().is_empty() {
+                    return Err(invalid(
+                        "legacy uncertain approval must be sealed before workflow import",
+                    ));
+                }
+                (RecoveryEvent::LegacyImported { data: import.0 }, None)
+            }
             RecoveryCommand::Event(event) => {
-                if matches!(event, RecoveryEvent::ExecutionAuthorized { .. }) {
+                if matches!(
+                    event,
+                    RecoveryEvent::ExecutionAuthorized { .. }
+                        | RecoveryEvent::LegacyImported { .. }
+                ) {
                     return Err(invalid("execution requires an owned committed permit"));
                 }
                 (event, None)
@@ -324,7 +364,7 @@ impl RecoveryState {
             _ => {}
         }
         let id = commit_id.into();
-        if self.entries.iter().any(|entry| entry.request.id == id) {
+        if self.commit_ids.contains(&id) {
             return Err(invalid(
                 "commit identity already applied; read prior result",
             ));
@@ -339,11 +379,13 @@ impl RecoveryState {
         next.updated_at_ms = now_ms;
         let request =
             CommitRequest::new(id.clone(), self.revision, "recovery".into(), input.clone())?;
-        next.entries.push(RecoveryEntry {
+        next.digest = crate::binding::digest(&request);
+        next.commit_ids.insert(id.clone());
+        next.entries.push_back(std::sync::Arc::new(RecoveryEntry {
             request,
             now_ms,
             event,
-        });
+        }));
         Ok(Prepared::new_bound(
             id,
             self.revision,
@@ -358,8 +400,9 @@ impl RecoveryState {
     /// never returns effects/permits. Persist Recover before resuming any work.
     pub fn restore(
         config: RecoveryConfig,
-        entries: &[RecoveryEntry],
+        entries: impl AsRef<[RecoveryEntry]>,
     ) -> Result<Self, RecoveryError> {
+        let entries = entries.as_ref();
         let mut state = Self::new(config)?;
         let mut ids = BTreeSet::new();
         for entry in entries {
@@ -382,7 +425,9 @@ impl RecoveryState {
             state.apply(&entry.event, entry.now_ms, None)?;
             state.revision = entry.request.revision;
             state.updated_at_ms = entry.now_ms;
-            state.entries.push(entry.clone());
+            state.digest = crate::binding::digest(&entry.request);
+            state.commit_ids.insert(entry.request.id.clone());
+            state.entries.push_back(std::sync::Arc::new(entry.clone()));
         }
         state.recovery_required = true;
         Ok(state)
@@ -397,11 +442,7 @@ impl RecoveryState {
             &self.config,
             self.revision,
             self.updated_at_ms,
-            &self.tasks,
-            &self.deliveries,
-            &self.quarantined,
-            self.scripts.values().collect::<Vec<_>>(),
-            &self.candidates,
+            &self.digest,
             event,
             now,
         ))
@@ -617,6 +658,19 @@ impl RecoveryState {
         }
         let mut effects = Vec::new();
         match event {
+            RecoveryEvent::LegacyImported { data } => {
+                if self.revision != 0 || self.tasks.len() != 0 {
+                    return Err(invalid("legacy import requires an empty workflow"));
+                }
+                let imported = super::legacy::validate_import(data, &self.config, now, false)?;
+                self.tasks = imported.tasks;
+                self.scripts = imported.scripts;
+                self.candidates = imported.candidates;
+                self.deliveries = imported.deliveries;
+                self.quarantined = imported.quarantined;
+                self.legacy_delivery_order = imported.delivery_order;
+                self.recovery_required = true;
+            }
             RecoveryEvent::Register { problem, incident } => {
                 problem.validate()?;
                 if problem.target_id != self.config.target.target_id {
@@ -655,13 +709,15 @@ impl RecoveryState {
                     })
                     .count() as u64
                     + 1;
+                let mut identity = self
+                    .revision
+                    .checked_add(1)
+                    .ok_or(RecoveryError::Capacity)?;
+                while self.tasks.contains_key(&format!("task-{identity:016x}")) {
+                    identity = identity.checked_add(1).ok_or(RecoveryError::Capacity)?;
+                }
                 let task = RecoveryTask {
-                    id: format!(
-                        "task-{:016x}",
-                        self.revision
-                            .checked_add(1)
-                            .ok_or(RecoveryError::Capacity)?
-                    ),
+                    id: format!("task-{identity:016x}"),
                     revision: 0,
                     problem: problem.clone(),
                     episode_count,
@@ -1256,7 +1312,19 @@ impl RecoveryState {
                     && self.deliveries.values().any(|older| {
                         !older.delivered
                             && older.candidate.id == current.candidate.id
-                            && older.created_revision < current.created_revision
+                            && (
+                                older.created_revision,
+                                self.legacy_delivery_order
+                                    .get(&older.id)
+                                    .copied()
+                                    .unwrap_or(0),
+                            ) < (
+                                current.created_revision,
+                                self.legacy_delivery_order
+                                    .get(&current.id)
+                                    .copied()
+                                    .unwrap_or(0),
+                            )
                     })
                 {
                     return Err(invalid("earlier knowledge outcome must be delivered first"));

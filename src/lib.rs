@@ -3,6 +3,8 @@
 //! The trusted Host owns durable storage, atomic version checks, authentication,
 //! scheduling, target ownership, external calls and process supervision. Core
 //! validates their domain inputs and releases effects after commit confirmation.
+mod binding;
+mod collections;
 mod identity;
 pub mod operation;
 pub mod recovery;

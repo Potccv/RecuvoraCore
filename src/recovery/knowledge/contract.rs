@@ -251,6 +251,11 @@ pub enum KnowledgeError {
 /// Trusted Host inputs. This enum deliberately cannot be deserialized into authority.
 #[derive(Clone, Debug, Serialize)]
 pub enum KnowledgeCommand {
+    /// Monotonic capacity migration; all domain facts remain intact.
+    ExpandCapacity {
+        expected: KnowledgeConfig,
+        target: KnowledgeConfig,
+    },
     UpsertCandidate(KnowledgeCandidate),
     RecordOutcome {
         record_id: String,

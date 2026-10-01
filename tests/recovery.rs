@@ -178,10 +178,31 @@ impl Flow {
         let pending = self
             .approvals
             .prepare(
+                format!("review-{}", self.approvals.revision()),
+                ApprovalEvent::Changed {
+                    request_id: id.clone(),
+                    change: ApprovalChange::BeginReview {
+                        expected_revision: self.approvals.get(&id).unwrap().revision,
+                        timeout_secs: 10,
+                    },
+                },
+                Some(&policy()),
+                100,
+            )
+            .unwrap();
+        let (approvals, mut effects) = commit(pending);
+        self.approvals = approvals;
+        let ApprovalEffect::Review(attempt) = effects.remove(0) else {
+            panic!("review effect")
+        };
+        let pending = self
+            .approvals
+            .prepare(
                 format!("assess-{}", self.approvals.revision()),
                 ApprovalEvent::Changed {
                     request_id: id.clone(),
-                    change: ApprovalChange::Assess {
+                    change: ApprovalChange::AssessAttempt {
+                        attempt,
                         assessment: ApprovalAssessment {
                             decision: ApprovalDecision::Approve,
                             reason: "valid".into(),
@@ -877,7 +898,30 @@ fn human_denial_of_reuse_is_terminal_but_harness_denial_allows_alternative() {
                 assessment,
             }
         } else {
-            ApprovalChange::Assess { assessment }
+            let pending = flow
+                .approvals
+                .prepare(
+                    "review-reuse".into(),
+                    ApprovalEvent::Changed {
+                        request_id: id.clone(),
+                        change: ApprovalChange::BeginReview {
+                            expected_revision: record.revision,
+                            timeout_secs: 10,
+                        },
+                    },
+                    Some(&policy()),
+                    100,
+                )
+                .unwrap();
+            let (approvals, mut effects) = commit(pending);
+            flow.approvals = approvals;
+            let ApprovalEffect::Review(attempt) = effects.remove(0) else {
+                panic!("review effect")
+            };
+            ApprovalChange::AssessAttempt {
+                attempt,
+                assessment,
+            }
         };
         flow.approvals = commit(
             flow.approvals
@@ -1100,4 +1144,610 @@ fn completed_approval_without_task_receipt_can_enter_explicit_reconciliation() {
         approval: flow.approvals.get(&id).unwrap().clone(),
     });
     assert_eq!(flow.task().stage, RecoveryStage::Completed);
+}
+
+#[test]
+fn scale_recovery_tasks_retain_incremental_history_and_explicit_recovery() {
+    let config = RecoveryConfig {
+        max_tasks: 1000,
+        ..config()
+    };
+    let mut state = RecoveryState::new(config.clone()).unwrap();
+    let knowledge = KnowledgeState::new(KnowledgeConfig::default()).unwrap();
+    let start = std::time::Instant::now();
+    let mut largest = 0;
+    for i in 0..500 {
+        let incident_id = format!("incident-{i}");
+        let pending = state
+            .prepare(
+                format!("register-{i}"),
+                RecoveryCommand::Event(RecoveryEvent::Register {
+                    problem: problem(&incident_id),
+                    incident: IncidentEvidence {
+                        incident_id: incident_id.clone(),
+                        revision: 1,
+                        active: true,
+                    },
+                }),
+                100_000,
+                &knowledge,
+            )
+            .unwrap();
+        largest = largest.max(serde_json::to_vec(pending.request()).unwrap().len());
+        state = commit(pending).0;
+        let task = state
+            .tasks()
+            .find(|t| t.problem.incident_id == incident_id)
+            .unwrap();
+        assert_eq!(task.episode_count, i + 1);
+        let pending = state
+            .prepare(
+                format!("cancel-{i}"),
+                RecoveryCommand::Event(RecoveryEvent::Cancel {
+                    task_id: task.id.clone(),
+                    revision: task.revision,
+                    approval: None,
+                }),
+                100_000,
+                &knowledge,
+            )
+            .unwrap();
+        largest = largest.max(serde_json::to_vec(pending.request()).unwrap().len());
+        assert!(largest < 4000);
+        state = commit(pending).0;
+    }
+    let prepare = start.elapsed();
+    let entries = state.entries();
+    let bytes = serde_json::to_vec(&entries).unwrap().len();
+    let start = std::time::Instant::now();
+    let restored = RecoveryState::restore(config.clone(), &entries).unwrap();
+    let restore = start.elapsed();
+    assert_eq!(restored.tasks().count(), 500);
+    assert!(restored.recovery_required());
+    let pending = restored
+        .prepare(
+            "recover",
+            RecoveryCommand::Event(RecoveryEvent::Recover),
+            100_000,
+            &knowledge,
+        )
+        .unwrap();
+    let (_, effects) = commit(pending);
+    assert!(effects.is_empty());
+    let mut changed = entries;
+    changed[1].request.input[3] = serde_json::json!("0".repeat(64));
+    assert!(RecoveryState::restore(config, changed).is_err());
+    println!(
+        "scale recovery n=500 max_request={largest} history_bytes={bytes} prepare={prepare:?} restore={restore:?}"
+    );
+}
+
+fn legacy_revisions() -> (Vec<LegacyRecoveryRevision>, ApprovalLedger, KnowledgeState) {
+    let mut task = LegacyRecoveryTask {
+        id: "legacy-random-task-4ad1".into(),
+        revision: 1,
+        problem: problem("legacy-incident"),
+        episode_count: 0,
+        stage: LegacyRecoveryStage::Queued,
+        diagnosis_attempts: 0,
+        plan: None,
+        knowledge_id: None,
+        reused_script: false,
+        approval_id: None,
+        operation: None,
+        observation: None,
+        receipt: None,
+        verification: None,
+        result_check: None,
+        note: None,
+        created_at_ms: 100_000,
+        updated_at_ms: 100_000,
+    };
+    let mut history = vec![LegacyRecoveryRevision {
+        format: 1,
+        sequence: 1,
+        task: task.clone(),
+    }];
+    task.revision = 2;
+    task.stage = LegacyRecoveryStage::Diagnosing;
+    history.push(LegacyRecoveryRevision {
+        format: 1,
+        sequence: 2,
+        task: task.clone(),
+    });
+    task.revision = 3;
+    task.diagnosis_attempts = 1;
+    task.observation = Some(observation());
+    history.push(LegacyRecoveryRevision {
+        format: 1,
+        sequence: 3,
+        task: task.clone(),
+    });
+    task.revision = 4;
+    task.stage = LegacyRecoveryStage::AwaitingApproval;
+    task.plan = Some(plan(1));
+    task.operation = Some(ProposedOperation {
+        task_id: task.id.clone(),
+        task_revision: 3,
+        operation_id: "legacy-original-operation".into(),
+        target: "target".into(),
+        action: serde_json::json!({"kind":"execute_script","executor_id":"executor","script":plan(1).script,"verification_profile":"business","required_facts":facts(),"timeout_secs":30,"incident_id":"legacy-incident","incident_revision":1}),
+    });
+    history.push(LegacyRecoveryRevision {
+        format: 1,
+        sequence: 4,
+        task: task.clone(),
+    });
+    let entries = vec![
+        LegacyApprovalEntry {
+            sequence: 1,
+            now: 100,
+            event: serde_json::json!({"event":"requested","request":{"request_id":"approval-0000000000000001","operation":task.operation,"policy":policy(),"created_at":100,"expires_at":700}}),
+        },
+        LegacyApprovalEntry {
+            sequence: 2,
+            now: 100,
+            event: serde_json::json!({"event":"changed","request_id":"approval-0000000000000001","change":{"change":"assess","assessment":{"decision":"approve","reason":"original review","reviewer":{"source":"harness","harness_id":"reviewer","session_id":"legacy-session"}}}}),
+        },
+    ];
+    let import = ApprovalImport::validate(ApprovalLimits::default(), entries).unwrap();
+    let approvals = commit(
+        ApprovalLedger::new(ApprovalLimits::default())
+            .unwrap()
+            .prepare_import("approval-0000000000000001s".into(), import, 100)
+            .unwrap(),
+    )
+    .0;
+    task.revision = 5;
+    task.approval_id = Some("approval-0000000000000001".into());
+    history.push(LegacyRecoveryRevision {
+        format: 1,
+        sequence: 5,
+        task,
+    });
+    (
+        history,
+        approvals,
+        KnowledgeState::new(KnowledgeConfig::default()).unwrap(),
+    )
+}
+fn push_legacy(history: &mut Vec<LegacyRecoveryRevision>, stage: LegacyRecoveryStage) {
+    let mut task = history.last().unwrap().task.clone();
+    task.revision += 1;
+    task.stage = stage;
+    history.push(LegacyRecoveryRevision {
+        format: 1,
+        sequence: history.len() as u64 + 1,
+        task,
+    });
+}
+fn import_workflow(
+    history: Vec<LegacyRecoveryRevision>,
+    approvals: &ApprovalLedger,
+    knowledge: &KnowledgeState,
+) -> RecoveryState {
+    let import = RecoveryImport::validate(config(), history, approvals, knowledge).unwrap();
+    let (state, effects) = commit(
+        RecoveryState::new(config())
+            .unwrap()
+            .prepare_import("legacy-workflow", import, 100_000)
+            .unwrap(),
+    );
+    assert!(effects.is_empty());
+    assert!(state.recovery_required());
+    state
+}
+
+#[test]
+fn legacy_full_history_preserves_random_identity_budget_and_resume_operation() {
+    let (history, approvals, knowledge) = legacy_revisions();
+    let old = history.last().unwrap().task.clone();
+    let state = import_workflow(history, &approvals, &knowledge);
+    let task = state.task(&old.id).unwrap();
+    assert_eq!(task.stage, RecoveryStage::Paused);
+    assert_eq!(task.episode_count, 1);
+    assert_eq!(task.revision, 5);
+    assert_eq!(task.diagnosis_attempts, 1);
+    assert_eq!(task.operation, old.operation);
+    let state = RecoveryState::restore(config(), state.entries()).unwrap();
+    let (state, effects) = commit(
+        state
+            .prepare(
+                "recover",
+                RecoveryCommand::Event(RecoveryEvent::Recover),
+                100_000,
+                &knowledge,
+            )
+            .unwrap(),
+    );
+    assert!(effects.is_empty());
+    let (state, effects) = commit(
+        state
+            .prepare(
+                "resume",
+                RecoveryCommand::Event(RecoveryEvent::Resume {
+                    task_id: old.id.clone(),
+                    revision: 5,
+                }),
+                100_000,
+                &knowledge,
+            )
+            .unwrap(),
+    );
+    assert!(effects.is_empty());
+    assert_eq!(state.task(&old.id).unwrap().operation, old.operation);
+}
+
+#[test]
+fn legacy_history_rejects_missing_or_changed_authority_and_revision_facts() {
+    for corruption in 0..7 {
+        let (mut history, approvals, knowledge) = legacy_revisions();
+        match corruption {
+            0 => {
+                history.remove(1);
+            }
+            1 => history[4].task.diagnosis_attempts = 0,
+            2 => {
+                history[4].task.operation.as_mut().unwrap().action["timeout_secs"] =
+                    serde_json::json!(99)
+            }
+            3 => history[4].task.approval_id = Some("other".into()),
+            4 => history[4].task.episode_count = 9,
+            5 => history[4].task.plan.as_mut().unwrap().script.source = "changed".into(),
+            _ => history[0].format = 2,
+        }
+        assert!(
+            RecoveryImport::validate(config(), history, &approvals, &knowledge).is_err(),
+            "corruption {corruption}"
+        );
+    }
+}
+
+#[test]
+fn legacy_uncertain_unconsumed_intent_is_sealed_without_new_execution() {
+    for stage in [LegacyRecoveryStage::Executing, LegacyRecoveryStage::Unknown] {
+        let (mut history, approvals, knowledge) = legacy_revisions();
+        push_legacy(&mut history, LegacyRecoveryStage::Executing);
+        if stage == LegacyRecoveryStage::Unknown {
+            push_legacy(&mut history, stage);
+        }
+        let import =
+            RecoveryImport::validate(config(), history.clone(), &approvals, &knowledge).unwrap();
+        let mut proofs = import.execution_uncertainties();
+        assert_eq!(proofs.len(), 1);
+        assert!(
+            RecoveryState::new(config())
+                .unwrap()
+                .prepare_import("unsafe-import", import, 100_000)
+                .is_err()
+        );
+        let (approvals, effects) = commit(
+            approvals
+                .prepare_legacy_uncertain("seal".into(), proofs.remove(0), 100)
+                .unwrap(),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            approvals.get("approval-0000000000000001").unwrap().state,
+            ApprovalState::Unknown
+        );
+        let state = import_workflow(history, &approvals, &knowledge);
+        let task = state.tasks().next().unwrap();
+        assert_eq!(task.stage, RecoveryStage::Unknown);
+        assert!(state.is_quarantined("script", 1));
+        assert_eq!(state.pending_deliveries().len(), 1);
+        let (state, effects) = commit(
+            state
+                .prepare(
+                    "recover",
+                    RecoveryCommand::Event(RecoveryEvent::Recover),
+                    100_000,
+                    &knowledge,
+                )
+                .unwrap(),
+        );
+        assert!(effects.is_empty());
+        let task = state.tasks().next().unwrap();
+        assert!(
+            state
+                .prepare(
+                    "resume",
+                    RecoveryCommand::Event(RecoveryEvent::Resume {
+                        task_id: task.id.clone(),
+                        revision: task.revision
+                    }),
+                    100_000,
+                    &knowledge
+                )
+                .is_err()
+        );
+        let restored = RecoveryState::restore(config(), state.entries()).unwrap();
+        assert!(restored.is_quarantined("script", 1));
+    }
+}
+
+fn legacy_publication() -> (Vec<LegacyRecoveryRevision>, ApprovalLedger, KnowledgeState) {
+    let (mut history, approvals, knowledge) = legacy_revisions();
+    let approvals = commit(
+        approvals
+            .prepare_recovery("approval-recover".into(), 100)
+            .unwrap(),
+    )
+    .0;
+    let (approvals, mut effects) = commit(
+        approvals
+            .prepare(
+                "consume".into(),
+                ApprovalEvent::Changed {
+                    request_id: "approval-0000000000000001".into(),
+                    change: ApprovalChange::Consume,
+                },
+                Some(&policy()),
+                100,
+            )
+            .unwrap(),
+    );
+    let ApprovalEffect::Execute(permit) = effects.remove(0) else {
+        panic!("permit")
+    };
+    let approvals = commit(
+        approvals
+            .prepare_complete(
+                "receipt".into(),
+                permit,
+                ExecutionOutcome::Executed,
+                "original receipt".into(),
+                100,
+            )
+            .unwrap(),
+    )
+    .0;
+    push_legacy(&mut history, LegacyRecoveryStage::Executing);
+    push_legacy(&mut history, LegacyRecoveryStage::Verifying);
+    history.last_mut().unwrap().task.receipt = Some(ScriptReceipt {
+        operation_id: "legacy-original-operation".into(),
+        target_id: "target".into(),
+        outcome: ScriptOutcome::Executed,
+        executor_stopped: true,
+        evidence_refs: vec!["receipt:original".into()],
+        summary: "original receipt".into(),
+    });
+    push_legacy(&mut history, LegacyRecoveryStage::Publishing);
+    history.last_mut().unwrap().task.verification = Some(BusinessVerification {
+        operation_id: "legacy-original-operation".into(),
+        target_id: "target".into(),
+        profile: "business".into(),
+        healthy: Some(true),
+        executor_stopped: true,
+        evidence_refs: vec!["verification:original".into()],
+        verified_at_ms: 100_000,
+    });
+    (history, approvals, knowledge)
+}
+fn deliver_legacy(mut knowledge: KnowledgeState, delivery: &KnowledgeDelivery) -> KnowledgeState {
+    knowledge = commit(
+        knowledge
+            .propose(
+                format!("candidate-{}", knowledge.revision()),
+                KnowledgeCommand::UpsertCandidate(delivery.candidate.clone()),
+            )
+            .unwrap(),
+    )
+    .0;
+    let proof = delivery.verification.as_ref().map(|v| {
+        TrustedBusinessVerification::attest(
+            &v.operation_id,
+            &v.target_id,
+            &v.script_id,
+            v.script_version,
+            &v.verifier_id,
+            v.evidence_refs.clone(),
+            v.verified_at_ms,
+        )
+        .unwrap()
+    });
+    commit(
+        knowledge
+            .propose(
+                format!("case-{}", knowledge.revision()),
+                KnowledgeCommand::RecordOutcome {
+                    record_id: delivery.candidate.id.clone(),
+                    case: delivery.case.clone(),
+                    verification: proof,
+                },
+            )
+            .unwrap(),
+    )
+    .0
+}
+#[test]
+fn legacy_publication_keeps_exact_case_identity_and_precommitted_timestamp() {
+    let (history, approvals, knowledge) = legacy_publication();
+    let state = import_workflow(history.clone(), &approvals, &knowledge);
+    assert_eq!(
+        state.tasks().next().unwrap().stage,
+        RecoveryStage::Completed
+    );
+    let delivery = state.pending_deliveries().remove(0);
+    assert_eq!(delivery.case.id, "legacy-original-operation-Verified");
+    assert_eq!(delivery.case.recorded_at_ms, 100_000);
+    let knowledge = deliver_legacy(knowledge, &delivery);
+    let imported = import_workflow(history.clone(), &approvals, &knowledge);
+    assert!(imported.pending_deliveries().is_empty());
+    let mut bad = history;
+    bad.last_mut().unwrap().task.updated_at_ms += 1;
+    assert!(RecoveryImport::validate(config(), bad, &approvals, &knowledge).is_err());
+}
+
+#[test]
+fn legacy_terminal_and_case_associations_cannot_be_substituted() {
+    let (mut history, approvals, knowledge) = legacy_publication();
+    push_legacy(&mut history, LegacyRecoveryStage::Completed);
+    history.last_mut().unwrap().task.knowledge_id = Some("unrelated-candidate".into());
+    assert!(RecoveryImport::validate(config(), history, &approvals, &knowledge).is_err());
+    let (mut history, approvals, knowledge) = legacy_revisions();
+    push_legacy(&mut history, LegacyRecoveryStage::Executing);
+    let import =
+        RecoveryImport::validate(config(), history.clone(), &approvals, &knowledge).unwrap();
+    let proof = import.execution_uncertainties().remove(0);
+    let approvals = commit(
+        approvals
+            .prepare_legacy_uncertain("seal".into(), proof, 100)
+            .unwrap(),
+    )
+    .0;
+    let state = import_workflow(history.clone(), &approvals, &knowledge);
+    let mut delivery = state.pending_deliveries().remove(0);
+    delivery.case.operation_id = "unrelated-operation".into();
+    let knowledge = deliver_legacy(knowledge, &delivery);
+    assert!(RecoveryImport::validate(config(), history, &approvals, &knowledge).is_err());
+}
+
+#[test]
+fn legacy_imported_unknown_reconciles_without_losing_prior_quarantine_or_case_identity() {
+    let (mut history, approvals, knowledge) = legacy_revisions();
+    push_legacy(&mut history, LegacyRecoveryStage::Executing);
+    let import =
+        RecoveryImport::validate(config(), history.clone(), &approvals, &knowledge).unwrap();
+    let proof = import.execution_uncertainties().remove(0);
+    let approvals = commit(
+        approvals
+            .prepare_legacy_uncertain("seal".into(), proof, 100)
+            .unwrap(),
+    )
+    .0;
+    let state = import_workflow(history, &approvals, &knowledge);
+    let id = state.tasks().next().unwrap().id.clone();
+    let original = state.pending_deliveries().remove(0);
+    let mut flow = Flow {
+        state,
+        knowledge,
+        approvals,
+        id,
+    };
+    flow.step(RecoveryEvent::Recover);
+    flow.approvals = commit(
+        flow.approvals
+            .prepare_recovery("approval-recover".into(), 100)
+            .unwrap(),
+    )
+    .0;
+    let execution = ExecutionResultCheck {
+        operation_id: "legacy-original-operation".into(),
+        target_id: "target".into(),
+        executor_id: "executor".into(),
+        outcome: CheckedExecution::Executed,
+        executor_stopped: true,
+        evidence_refs: vec!["result:independent".into()],
+        checked_at_ms: 100_000,
+    };
+    let verification = flow.verification(Some(true));
+    let event = |flow: &Flow| RecoveryEvent::ResultChecked {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        execution: execution.clone(),
+        verification: verification.clone(),
+        actor: "operator".into(),
+        approval: flow
+            .approvals
+            .get("approval-0000000000000001")
+            .unwrap()
+            .clone(),
+    };
+    flow.step(event(&flow));
+    assert_eq!(flow.task().stage, RecoveryStage::Unknown);
+    let record = flow.approvals.get("approval-0000000000000001").unwrap();
+    flow.approvals = commit(
+        flow.approvals
+            .prepare(
+                "reconcile".into(),
+                ApprovalEvent::Changed {
+                    request_id: record.request.request_id.clone(),
+                    change: ApprovalChange::Reconcile {
+                        outcome: ExecutionOutcome::Executed,
+                        actor: "operator".into(),
+                        reason: "result:independent".into(),
+                    },
+                },
+                None,
+                100,
+            )
+            .unwrap(),
+    )
+    .0;
+    flow.step(event(&flow));
+    assert_eq!(flow.task().stage, RecoveryStage::Completed);
+    let deliveries = flow.state.pending_deliveries();
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!(deliveries[0].case, original.case);
+    assert_eq!(deliveries[1].candidate, original.candidate);
+    assert_eq!(deliveries[1].case.id, "legacy-original-operation-Verified");
+    for delivery in deliveries {
+        flow.knowledge = deliver_legacy(flow.knowledge, &delivery);
+        flow.step(RecoveryEvent::DeliveryConfirmed {
+            delivery_id: delivery.id,
+        });
+    }
+    assert!(flow.state.is_quarantined("script", 1));
+    assert!(flow.knowledge.is_quarantined("script", 1));
+    assert_eq!(
+        flow.knowledge
+            .get(&original.candidate.id)
+            .unwrap()
+            .cases
+            .len(),
+        2
+    );
+    RecoveryState::restore(config(), flow.state.entries()).unwrap();
+}
+
+#[test]
+fn legacy_task_id_collision_keeps_prior_incident_episode() {
+    let (history, _, knowledge) = legacy_revisions();
+    let mut first = history[0].clone();
+    first.task.id = "task-0000000000000003".into();
+    let mut history = vec![first];
+    push_legacy(&mut history, LegacyRecoveryStage::Canceled);
+    let approvals = ApprovalLedger::new(ApprovalLimits::default()).unwrap();
+    let state = import_workflow(history, &approvals, &knowledge);
+    let (state, _) = commit(
+        state
+            .prepare(
+                "recover",
+                RecoveryCommand::Event(RecoveryEvent::Recover),
+                100_000,
+                &knowledge,
+            )
+            .unwrap(),
+    );
+    let (state, _) = commit(
+        state
+            .prepare(
+                "new",
+                RecoveryCommand::Event(RecoveryEvent::Register {
+                    problem: problem("second-incident"),
+                    incident: IncidentEvidence {
+                        incident_id: "second-incident".into(),
+                        revision: 1,
+                        active: true,
+                    },
+                }),
+                100_000,
+                &knowledge,
+            )
+            .unwrap(),
+    );
+    assert_eq!(state.tasks().count(), 2);
+    assert_eq!(
+        state
+            .task("task-0000000000000003")
+            .unwrap()
+            .problem
+            .incident_id,
+        "legacy-incident"
+    );
+    assert_eq!(
+        state.task("task-0000000000000004").unwrap().episode_count,
+        2
+    );
 }

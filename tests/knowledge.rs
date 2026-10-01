@@ -552,3 +552,262 @@ fn host_transport_export_preserves_failure_history_after_success() {
     assert_eq!(snapshot["records"][0]["status"], "verified");
     assert!(state.is_quarantined("repair-script", 1));
 }
+
+#[test]
+fn external_candidate_normalization_is_repeatable_but_conflicts_remain_atomic() {
+    let mut raw = candidate("external", 1);
+    raw.reusable = true;
+    raw.evidence_refs.push("observation:2".into());
+    let proposal = KnowledgeProposal {
+        source_id: "source".into(),
+        candidate: raw,
+        evidence_refs: vec!["proposal:2".into(), "proposal:1".into()],
+    };
+    let normalized = initial()
+        .validate_external_candidates("source", &query(), vec![proposal.clone()])
+        .unwrap()
+        .remove(0);
+    assert!(!normalized.reusable);
+    let state = commit(
+        initial(),
+        KnowledgeCommand::UpsertCandidate(normalized.clone()),
+    );
+    assert_eq!(
+        state
+            .validate_external_candidates("source", &query(), vec![proposal.clone()])
+            .unwrap(),
+        vec![normalized.clone()]
+    );
+    let mut reordered = proposal.clone();
+    reordered.candidate.evidence_refs.reverse();
+    reordered.evidence_refs.reverse();
+    reordered
+        .candidate
+        .evidence_refs
+        .push("knowledge-source:source".into());
+    assert_eq!(
+        state
+            .validate_external_candidates("source", &query(), vec![reordered])
+            .unwrap(),
+        vec![normalized]
+    );
+    for field in 0..3 {
+        let mut changed = proposal.clone();
+        match field {
+            0 => changed.candidate.script.source.push_str("changed"),
+            1 => changed.candidate.summary.push_str("changed"),
+            _ => changed.source_id = "other".into(),
+        }
+        let expected = changed.source_id.clone();
+        assert!(
+            state
+                .validate_external_candidates(&expected, &query(), vec![changed])
+                .is_err()
+        );
+    }
+    let mut conflict = proposal.clone();
+    conflict.candidate.id = "second".into();
+    conflict.candidate.script.source.push_str("changed");
+    assert!(
+        state
+            .validate_external_candidates("source", &query(), vec![proposal, conflict])
+            .is_err()
+    );
+    assert_eq!(state.projection().records, 1);
+}
+
+#[test]
+fn capacity_expansion_replays_and_preserves_all_isolation_and_identities() {
+    let original = KnowledgeConfig {
+        max_records: 2,
+        max_cases_per_record: 1,
+    };
+    let target = KnowledgeConfig {
+        max_records: 3,
+        max_cases_per_record: 2,
+    };
+    let mut state = KnowledgeState::new(original.clone()).unwrap();
+    let mut history = Vec::new();
+    let commands = vec![
+        KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
+        KnowledgeCommand::RecordOutcome {
+            record_id: "a".into(),
+            case: case("unknown", RepairOutcome::Unknown, 1),
+            verification: None,
+        },
+        KnowledgeCommand::UpsertCandidate(candidate("b", 2)),
+        KnowledgeCommand::RecordOutcome {
+            record_id: "b".into(),
+            case: case("failed", RepairOutcome::Failed, 2),
+            verification: None,
+        },
+        KnowledgeCommand::Disable {
+            record_id: "b".into(),
+            expected_revision: 2,
+            actor: "operator".into(),
+            reason: "disabled".into(),
+        },
+    ];
+    for (i, command) in commands.into_iter().enumerate() {
+        let pending = state
+            .propose(format!("commit-{i}"), command.clone())
+            .unwrap();
+        let request = pending.request().clone();
+        state = pending
+            .confirm(CommitReceipt::confirmed(&request))
+            .unwrap()
+            .state;
+        history.push((request, command));
+    }
+    let outcome = verified("a", "later", 1);
+    assert!(matches!(
+        state.propose("full", outcome.clone()),
+        Err(KnowledgeError::Capacity(_))
+    ));
+    let before = state.snapshot();
+    let expansion = KnowledgeCommand::ExpandCapacity {
+        expected: original.clone(),
+        target: target.clone(),
+    };
+    let pending = state.propose("expand", expansion.clone()).unwrap();
+    assert_eq!(state.snapshot(), before);
+    let request = pending.request().clone();
+    // Interruption before confirmation leaves the old configuration replayable.
+    drop(pending);
+    let replay = |items: &[(CommitRequest, KnowledgeCommand)], config: KnowledgeConfig| {
+        KnowledgeState::replay(
+            config,
+            items
+                .iter()
+                .map(|(request, command)| KnowledgeReplayEntry {
+                    request: request.clone(),
+                    command: command.clone(),
+                    receipt: CommitReceipt::confirmed(request),
+                })
+                .collect(),
+        )
+    };
+    assert_eq!(
+        replay(&history, original.clone()).unwrap().snapshot(),
+        before
+    );
+    assert!(replay(&history, target.clone()).is_err());
+    history.push((request.clone(), expansion.clone()));
+    state = replay(&history, original.clone()).unwrap();
+    assert_eq!(state.snapshot().config, target);
+    assert_eq!(state.snapshot().records, before.records);
+    assert!(state.is_quarantined("repair-script", 1));
+    assert!(state.is_quarantined("repair-script", 2));
+    assert!(state.propose("repeat", expansion).is_err());
+    assert!(state.propose("expand", outcome.clone()).is_err());
+    assert!(
+        state
+            .propose(
+                "shrink",
+                KnowledgeCommand::ExpandCapacity {
+                    expected: target.clone(),
+                    target: original.clone()
+                }
+            )
+            .is_err()
+    );
+    assert!(
+        state
+            .propose(
+                "invalid",
+                KnowledgeCommand::ExpandCapacity {
+                    expected: target.clone(),
+                    target: KnowledgeConfig {
+                        max_records: 100_001,
+                        ..target.clone()
+                    }
+                }
+            )
+            .is_err()
+    );
+    let pending = state.propose("later", outcome.clone()).unwrap();
+    history.push((pending.request().clone(), outcome));
+    state = pending
+        .confirm(CommitReceipt::confirmed(&history.last().unwrap().0))
+        .unwrap()
+        .state;
+    assert_eq!(state.get("a").unwrap().cases.len(), 2);
+    assert!(state.is_quarantined("repair-script", 1));
+    assert!(state.search(&query()).unwrap().is_empty());
+    let mut changed_case = case("unknown", RepairOutcome::Unknown, 1);
+    changed_case.operation_id = "different".into();
+    assert!(
+        state
+            .propose(
+                "id-conflict",
+                KnowledgeCommand::RecordOutcome {
+                    record_id: "a".into(),
+                    case: changed_case,
+                    verification: None
+                }
+            )
+            .is_err()
+    );
+    let mut changed_candidate = candidate("new", 1);
+    changed_candidate.script.source.push_str("changed");
+    assert!(
+        state
+            .propose(
+                "script-conflict",
+                KnowledgeCommand::UpsertCandidate(changed_candidate)
+            )
+            .is_err()
+    );
+    assert_eq!(
+        replay(&history, original).unwrap().snapshot(),
+        state.snapshot()
+    );
+    let mut bad = history.clone();
+    bad.last_mut().unwrap().0.input[0] = serde_json::json!("0".repeat(64));
+    assert!(
+        replay(
+            &bad,
+            KnowledgeConfig {
+                max_records: 2,
+                max_cases_per_record: 1
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn scale_knowledge_commits_bind_incremental_commands() {
+    let mut state = initial();
+    let start = std::time::Instant::now();
+    let mut history = Vec::new();
+    let mut largest = 0;
+    for i in 0..500 {
+        let command =
+            KnowledgeCommand::UpsertCandidate(candidate(&format!("candidate-{i}"), i + 1));
+        let pending = state
+            .propose(format!("commit-{i}"), command.clone())
+            .unwrap();
+        largest = largest.max(serde_json::to_vec(pending.request()).unwrap().len());
+        assert!(largest < 2000);
+        let request = pending.request().clone();
+        state = pending
+            .confirm(CommitReceipt::confirmed(&request))
+            .unwrap()
+            .state;
+        history.push(KnowledgeReplayEntry {
+            receipt: CommitReceipt::confirmed(&request),
+            request,
+            command,
+        });
+    }
+    let prepare = start.elapsed();
+    let start = std::time::Instant::now();
+    let restored = KnowledgeState::replay(KnowledgeConfig::default(), history).unwrap();
+    let restore = start.elapsed();
+    assert_eq!(restored.snapshot(), state.snapshot());
+    println!(
+        "scale knowledge n=500 max_request={largest} snapshot_bytes={} prepare={prepare:?} restore={restore:?}",
+        serde_json::to_vec(&state.snapshot()).unwrap().len()
+    );
+}

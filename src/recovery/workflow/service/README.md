@@ -10,7 +10,7 @@
 
 ## 使用与提交
 
-`new(config)` 创建空状态；`prepare(commit_id, command, now_ms, knowledge)` 返回 `Prepared<RecoveryState, RecoveryEffect>`。准备不修改原状态，`state()` 只读访问拟提交状态；Host 持久保存新增 `RecoveryEntry` 及提交身份，原子比较聚合版本后调用 `confirm`，再安装结果并处理返回效果。请求绑定配置、先前领域状态、完整事件与时间。
+`new(config)` 创建空状态；`prepare(commit_id, command, now_ms, knowledge)` 返回 `Prepared<RecoveryState, RecoveryEffect>`。准备不修改原状态，`state()` 只读访问拟提交状态；Host 持久保存新增 `RecoveryEntry` 及提交身份，原子比较聚合版本后调用 `confirm`，再安装结果并处理返回效果。请求绑定配置、先前完整领域历史摘要、完整事件与时间，内部集合与历史使用结构共享。
 
 `RecoveryCommand::Event` 输入普通领域事件。实际执行使用 `RecoveryCommand::AuthorizeExecution`，要求持有审批域确认消费后返回的 `ExecutionPermit`；相应 `RecoveryEffect::Execute` 在流程提交确认后交还该一次许可。直接提交 `ExecutionAuthorized` 事件不能获取执行资格。Host 必须维持目标所有权及当前故障条件，不能把 `TargetAuthority` 数据结构当成分布式锁。
 
@@ -18,7 +18,7 @@ Host 执行诊断、审批接入、动作和验收；返回事件必须绑定提
 
 ## 恢复与查询
 
-`entries()` 返回可序列化的领域历史；`restore(config, entries)` 重复实时验证并拒绝顺序、身份、内容或迁移不一致，不返回任何执行效果。恢复后 `recovery_required()` 为 true，必须先提交 `Recover`。审批等待转为 `Paused` 并要求显式 `Resume`；中断执行转 Unknown 并保存版本隔离；诊断次数不退还，旧回调失效。Host 在恢复或取消前处理旧调用的停止与资源归属。
+`latest_entry()` 只读访问最新条目，`entries()` 复制导出完整 `Vec<RecoveryEntry>`；`restore(config, entries)` 重复实时验证并拒绝顺序、身份、内容或迁移不一致，不返回任何执行效果。恢复后 `recovery_required()` 为 true，必须先提交 `Recover`。审批等待转为 `Paused` 并要求显式 `Resume`；中断执行转 Unknown 并保存版本隔离；诊断次数不退还，旧回调失效。Host 在恢复或取消前处理旧调用的停止与资源归属。历史摘要及增量持久化约定见[领域维护](../../../../docs/domain-maintenance.md#增量绑定与历史导出)。
 
 `task`、`tasks` 返回只读领域状态；`RecoveryTaskSummary::from` 给出阶段、下一步、版本及原因，不产生授权。任务登记区分独立故障轮次与异常样本数，未结束任务阻塞同目标新任务，重复故障身份返回原轮次。
 
@@ -29,3 +29,6 @@ Host 执行诊断、审批接入、动作和验收；返回事件必须绑定提
 `pending_deliveries()` 返回尚未确认的经验交付数据，Host 可幂等重试；知识模块确认提交后才输入 `DeliveryConfirmed`。交付重试不重新诊断或执行。历史 Unknown 的隔离在后来验收成功后仍保留。交付顺序、重放与跨域恢复细节见[恢复流程](../../../../docs/recovery.md)和[领域维护](../../../../docs/domain-maintenance.md)。
 
 规则见[AGENTS](AGENTS.md)。
+
+
+[legacy.rs](legacy.rs) 校验完整旧任务迁移链和跨域关联，构造无副作用导入提案及不确定原审批封锁证明；不执行日志读取、文件安装或历史快照直装。实现使用共享记录映射以限制大记录插入的栈占用。

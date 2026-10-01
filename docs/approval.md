@@ -4,7 +4,7 @@
 
 ## 决定与身份
 
-人工与指定 Harness 的审核均受当前硬政策限制。Host 认证调用者并限制 API 访问，`actor`、Harness 和会话身份用于归属与审计，不是认证凭据。模型提供评估内容，Host 绑定可信审核来源和具体尝试；迟到结果不能替换当前审核。
+人工与指定 Harness 的审核均受当前硬政策限制。Host 认证调用者并限制 API 访问，`actor`、Harness 和会话身份用于归属与审计，不是认证凭据。模型提供评估内容，Host 绑定可信审核来源和具体尝试；迟到结果不能替换当前审核。Harness 结果必须使用已提交 `BeginReview` 返回的尝试调用 `AssessAttempt`；普通 `Assess` 在实时和普通历史校验中都被拒绝；完整旧历史仅经[专用导入验证](../src/recovery/approval/README.md#完整旧历史导入)保留当时事实，不重新产生审核或许可。
 
 `prepare_request` 保留完整 `ProposedOperation` 和 `ApprovalPolicy`，`find_operation` 用原任务及操作身份查找已有请求。Host 必须先提交恢复任务的操作意图，再创建或关联审批；审批记录存在不代表恢复域已经确认关联。
 

@@ -273,3 +273,91 @@ fn wrong_host_receipt_cannot_confirm_a_proposal() {
     );
     assert_eq!(ledger.revision(), 0);
 }
+
+#[test]
+fn history_digest_rejects_changed_prefix_config_and_cross_branch_receipts() {
+    let first = apply(&empty(), commit(1, SignalCondition::Active));
+    let second = apply(&first, commit(2, SignalCondition::Unknown));
+    let mut history = second.entries();
+    history[1].prior_digest = "0".repeat(64);
+    assert!(IncidentLedger::restore(IncidentLimits::default(), history).is_err());
+    let mut history = second.entries();
+    let IncidentEvent::Monitor { commit } = &mut history[0].event else {
+        panic!("monitor")
+    };
+    commit.checkpoint = json!({"other":true});
+    assert!(IncidentLedger::restore(IncidentLimits::default(), history).is_err());
+    let mut limits = IncidentLimits::default();
+    limits.max_incidents += 1;
+    assert!(IncidentLedger::restore(limits, second.entries()).is_err());
+    let mut alternate = crate::commit(1, SignalCondition::Active);
+    alternate.checkpoint = json!({"other":true});
+    let branch = apply(&empty(), alternate);
+    let left = first
+        .prepare_monitor("next".into(), crate::commit(2, SignalCondition::Unknown))
+        .unwrap()
+        .unwrap();
+    let right = branch
+        .prepare_monitor("next".into(), crate::commit(2, SignalCondition::Unknown))
+        .unwrap()
+        .unwrap();
+    assert!(
+        right
+            .confirm(CommitReceipt::confirmed(left.request()))
+            .is_err()
+    );
+}
+
+#[test]
+fn scale_healthy_polling_and_incident_growth_keep_requests_bounded() {
+    for growing in [false, true] {
+        let mut ledger = empty();
+        let start = std::time::Instant::now();
+        let mut largest = 0;
+        let mut cumulative = 0;
+        for i in 1..=2000 {
+            let mut input = commit(i, SignalCondition::Active);
+            input.checkpoint = json!({"cursor":i,"padding":"x".repeat(1024)});
+            input.now_ms = i * 30_000;
+            if growing {
+                input.signals[0].rule_id = format!("rule-{i}");
+            } else {
+                input.signals.clear();
+            }
+            let pending = ledger
+                .prepare_monitor(format!("commit-{i}"), input)
+                .unwrap()
+                .unwrap();
+            let bytes = serde_json::to_vec(pending.request()).unwrap().len();
+            largest = largest.max(bytes);
+            cumulative += bytes;
+            assert!(bytes < 2200);
+            ledger = install(pending);
+            if [1, 100, 1000, 2000].contains(&i) {
+                println!(
+                    "scale incidents growing={growing} n={i} request={bytes} cumulative={cumulative}"
+                );
+            }
+        }
+        let prepare = start.elapsed();
+        let entries = ledger.entries();
+        let bytes = serde_json::to_vec(&entries).unwrap().len();
+        let start = std::time::Instant::now();
+        let restored = IncidentLedger::restore(IncidentLimits::default(), &entries).unwrap();
+        let restore = start.elapsed();
+        assert_eq!(restored.list(), ledger.list());
+        assert_eq!(restored.list().len(), if growing { 2000 } else { 0 });
+        let IncidentEvent::Monitor { commit } = &ledger.latest_entry().unwrap().event else {
+            panic!("monitor")
+        };
+        assert!(
+            ledger
+                .prepare_monitor("exact-retry".into(), commit.clone())
+                .unwrap()
+                .is_none()
+        );
+        println!(
+            "scale incidents growing={growing} n=2000 max_request={largest} history_bytes={bytes} prepare={prepare:?} restore={restore:?}"
+        );
+    }
+}

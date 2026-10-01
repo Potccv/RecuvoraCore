@@ -43,6 +43,15 @@ impl KnowledgeState {
                     "duplicate external candidate identity".into(),
                 ));
             }
+            candidate.reusable = false;
+            let references: BTreeSet<_> = candidate
+                .evidence_refs
+                .into_iter()
+                .chain(proposal.evidence_refs)
+                .chain([format!("knowledge-source:{expected_source_id}")])
+                .collect();
+            candidate.evidence_refs = references.into_iter().collect();
+            validation::candidate(&candidate)?;
             if self
                 .records
                 .get(&candidate.id)
@@ -66,15 +75,6 @@ impl KnowledgeState {
             if self.quarantined.contains(&key) || !applicable(&candidate, query) {
                 continue;
             }
-            candidate.reusable = false;
-            let references: BTreeSet<_> = candidate
-                .evidence_refs
-                .into_iter()
-                .chain(proposal.evidence_refs)
-                .chain([format!("knowledge-source:{expected_source_id}")])
-                .collect();
-            candidate.evidence_refs = references.into_iter().collect();
-            validation::candidate(&candidate)?;
             accepted.push(candidate);
         }
         accepted.sort_by(|left, right| {

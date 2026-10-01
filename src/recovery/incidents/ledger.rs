@@ -5,25 +5,37 @@ impl IncidentLedger {
     pub fn new(config: IncidentLimits) -> Result<Self, IncidentError> {
         config.validate()?;
         Ok(Self {
+            digest: crate::binding::digest(&("incidents", &config)),
+            commit_ids: im::OrdSet::new(),
             config,
             sequence: 0,
-            history: Vec::new(),
-            records: BTreeMap::new(),
-            active: BTreeMap::new(),
-            monitors: BTreeMap::new(),
+            history: im::Vector::new(),
+            records: crate::collections::Map::new(),
+            active: crate::collections::Map::new(),
+            monitors: crate::collections::Map::new(),
         })
     }
     pub fn revision(&self) -> u64 {
         self.sequence
     }
-    pub fn entries(&self) -> &[IncidentEntry] {
-        &self.history
+    /// Copies the complete history for export; use latest_entry for incremental persistence.
+    pub fn entries(&self) -> Vec<IncidentEntry> {
+        self.history
+            .iter()
+            .map(|entry| entry.as_ref().clone())
+            .collect()
+    }
+
+    /// The newest validated entry, without copying the history.
+    pub fn latest_entry(&self) -> Option<&IncidentEntry> {
+        self.history.back().map(AsRef::as_ref)
     }
 
     pub fn restore(
         config: IncidentLimits,
-        entries: &[IncidentEntry],
+        entries: impl AsRef<[IncidentEntry]>,
     ) -> Result<Self, IncidentError> {
+        let entries = entries.as_ref();
         let mut ledger = Self::new(config)?;
         for entry in entries {
             ledger
@@ -71,26 +83,27 @@ impl IncidentLedger {
         commit_id: String,
         event: IncidentEvent,
     ) -> Result<Option<Prepared<Self>>, IncidentError> {
-        if self
-            .history
-            .iter()
-            .any(|entry| entry.commit_id == commit_id)
-        {
+        if self.commit_ids.contains(&commit_id) {
             return Err(IncidentError::Conflict("commit identity reused".into()));
         }
-        let input = serde_json::json!({"config":self.config,"history":self.history,"event":event});
         let sequence = next(self.sequence)?;
         let Some(transition) = self.compute(&event, sequence)? else {
             return Ok(None);
         };
+        let input =
+            serde_json::json!({"config":self.config,"prior_digest":self.digest,"event":event});
         let mut proposed = self.clone();
         proposed.install(transition);
         proposed.sequence = sequence;
-        proposed.history.push(IncidentEntry {
+        let entry = IncidentEntry {
+            prior_digest: self.digest.clone(),
             commit_id: commit_id.clone(),
             sequence,
             event,
-        });
+        };
+        proposed.digest = crate::binding::digest(&entry);
+        proposed.commit_ids.insert(commit_id.clone());
+        proposed.history.push_back(std::sync::Arc::new(entry));
         Ok(Some(Prepared::new_bound(
             commit_id,
             self.sequence,
@@ -102,14 +115,13 @@ impl IncidentLedger {
     }
 
     fn apply_entry(&mut self, entry: IncidentEntry) -> Result<(), IncidentError> {
+        if entry.prior_digest != self.digest {
+            return Err(IncidentError::Corrupt("history digest mismatch".into()));
+        }
         if !crate::identity::valid_id(&entry.commit_id) {
             return Err(IncidentError::Invalid("commit identity".into()));
         }
-        if self
-            .history
-            .iter()
-            .any(|previous| previous.commit_id == entry.commit_id)
-        {
+        if self.commit_ids.contains(&entry.commit_id) {
             return Err(IncidentError::Corrupt("duplicate commit identity".into()));
         }
         if next(self.sequence)? != entry.sequence {
@@ -120,7 +132,9 @@ impl IncidentLedger {
             .ok_or_else(|| IncidentError::Corrupt("duplicate committed event".into()))?;
         self.install(transition);
         self.sequence = entry.sequence;
-        self.history.push(entry);
+        self.digest = crate::binding::digest(&entry);
+        self.commit_ids.insert(entry.commit_id.clone());
+        self.history.push_back(std::sync::Arc::new(entry));
         Ok(())
     }
 }

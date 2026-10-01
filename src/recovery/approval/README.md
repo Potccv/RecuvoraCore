@@ -4,17 +4,17 @@
 
 ## 接口与提交
 
-`ApprovalLedger::new(ApprovalLimits)` 创建空聚合，`prepare_request` 准备绑定完整 `ProposedOperation` 和 `ApprovalPolicy` 的请求。请求身份按聚合下一记录版本号确定，`find_operation` 可按任务和操作身份查找既有请求；重复身份不能创建第二次审批，内容冲突需要拒绝。`prepare` 接收 `ApprovalEvent`、当前政策及 Host 时间，返回待提交状态；旧聚合不变。每次提案使用唯一提交身份，历史拒绝重复提交身份。
+`ApprovalLedger::new(ApprovalLimits)` 创建空聚合，`prepare_request` 准备绑定完整 `ProposedOperation` 和 `ApprovalPolicy` 的请求。请求身份从聚合下一记录版本号开始确定，并跳过旧历史导入已占用的身份，`find_operation` 可按任务和操作身份查找既有请求；重复身份不能创建第二次审批，内容冲突需要拒绝。`prepare` 接收 `ApprovalEvent`、当前政策及 Host 时间，返回待提交状态；旧聚合不变。每次提案使用唯一提交身份，历史拒绝重复提交身份。
 
-`Prepared::request` 绑定审批域、原始事件历史、配置、待提交事件、当前政策与时间，Host 将完整状态或事件以及请求身份置于同一原子事务，比较 `expected_revision` 后再确认。仅发送数据或加入队列不足以确认提交。提交失败、冲突或结果不明不能确认提案。确认不会写入任何存储，`CommitReceipt` 是可信 Host 的提交声明。
+`Prepared::request` 绑定审批域、原始事件历史的摘要、配置、待提交事件、当前政策与时间，Host 将完整状态或事件以及请求身份置于同一原子事务，比较 `expected_revision` 后再确认。仅发送数据或加入队列不足以确认提交。提交失败、冲突或结果不明不能确认提案。确认不会写入任何存储，`CommitReceipt` 是可信 Host 的提交声明。
 
-`ApprovalLedger` 可序列化为配置与事件历史；`entries` 返回可序列化的 `ApprovalEntry`，`restore` 用相同迁移校验重建聚合，不直接反序列化权威状态。`ApprovalLimits::max_requests` 是领域输入容量限制，不代表物理存储配额。Host 负责保存提交身份、完整历史与审批政策，不能丢失操作身份和一次消费事实。
+`ApprovalLedger` 可序列化为配置与事件历史；`entries` 复制导出完整 `Vec<ApprovalEntry>`，`latest_entry` 只读访问最新条目，`restore` 用相同迁移校验重建聚合，不直接反序列化权威状态。历史绑定及增量保存见[领域维护](../../../docs/domain-maintenance.md#增量绑定与历史导出)。`ApprovalLimits::max_requests` 是领域输入容量限制，不代表物理存储配额。Host 负责保存提交身份、完整历史与审批政策，不能丢失操作身份和一次消费事实。
 
 ## 审核规则
 
 `ApprovalChange` 表达人工决定、审核开始与结果、失败转人工、撤销、取消、过期、许可消费及结果核实。需要授权的迁移必须携带与请求完全相等的当前硬政策；人工批准也不能越过目标或动作范围。`HumanDecision` 的 `expected_revision` 拒绝过时界面决定；人工拒绝是终态。
 
-`BeginReview` 同时校验记录版本号、人工等待截止时间与审核预算，提交确认后产生 `ApprovalEffect::Review`。`AssessAttempt` 绑定审核尝试、记录版本号、Harness 身份和截止时间。Host 提供审核身份，模型仅提供决定和理由；迟到结果无效，失败转人工后不能再次自动审核。过期及失败是显式事件，Host 负责定时提交这些事件。
+`BeginReview` 同时校验记录版本号、人工等待截止时间与审核预算，提交确认后产生 `ApprovalEffect::Review`。`AssessAttempt` 绑定审核尝试、记录版本号、Harness 身份和截止时间。普通 `Assess` 在实时和普通历史校验中均返回 `ApprovalError::Invalid`；保留枚举仅用于明确拒绝旧输入，不能作为无尝试审核入口。Host 提供审核身份，模型仅提供决定和理由；迟到结果无效，失败转人工后不能再次自动审核。过期及失败是显式事件，Host 负责定时提交这些事件。
 
 ## 执行与恢复
 
@@ -25,3 +25,11 @@
 `restore` 只恢复记录，不产生审核或执行效果，非空聚合必须先通过 `prepare_recovery` 提交一个无效果的恢复事务。该事务将所有 Executing 转为 Unknown，在途审核转为 NeedsHuman，已经过期的待审批或已批准请求转为 Expired；人工等待截止时间不变。在恢复确认之前拒绝其他迁移，旧审核回调不能在恢复后取得授权。新旧实例的目标互斥和聚合原子提交由 Host 保证，本域内存对象不提供跨进程锁。
 
 领域回归见[集中测试](../../../tests/README.md)。
+
+## 完整旧历史导入
+
+`ApprovalImport::validate` 接收原 `ApprovalLimits` 和完整、连续编号的 `LegacyApprovalEntry`，逐条验证旧请求、审核、期限、消费及完成历史。Host 提供原事件 JSON；旧人工决定的隐式 revision 由 Core 按当时状态绑定。专用验证允许旧 `Assess`，同时检查 ReadyHarness、原 Harness 身份、TTL 与硬政策；不补造审核尝试，原请求 ID、记录 revision 和时间保持不变。
+
+仅空聚合的 `prepare_import` 接受该不可反序列化能力。Host 持久提交其完整 `Imported` 事件；确认与恢复均不产生 Review 或 Execute 效果，普通 `prepare` 拒绝构造 Imported。`restore` 对嵌入的完整历史重新验证；导入后先提交恢复边界才能继续一般操作。
+
+完整恢复迁移可证明旧工作流已写入 Unknown、原审批却仍 Approved。该证明使用 `LegacyExecutionUncertainty`，只由恢复域的完整跨域验证产生。`prepare_legacy_uncertain` 绑定原操作、审批 ID 与 revision，持久转为 Unknown，不编造 Consume，也不产生许可。该封锁允许在恢复事务前提交，防止 TTL 过期先改变原审批；随后仍须提交恢复边界。持久安装和原目标所有权由 Host 保证。

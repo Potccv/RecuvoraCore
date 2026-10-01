@@ -5,11 +5,13 @@ impl ApprovalLedger {
     pub fn new(config: ApprovalLimits) -> Result<Self, ApprovalError> {
         config.validate()?;
         Ok(Self {
+            digest: crate::binding::digest(&("approval", &config)),
+            commit_ids: im::OrdSet::new(),
             config,
             recovery_required: false,
             sequence: 0,
-            records: BTreeMap::new(),
-            history: Vec::new(),
+            records: crate::collections::Map::new(),
+            history: im::Vector::new(),
             identity: Arc::new(()),
         })
     }
@@ -18,8 +20,9 @@ impl ApprovalLedger {
     /// Executing records remain blocking until `RecoverUnknown` is committed.
     pub fn restore(
         config: ApprovalLimits,
-        entries: &[ApprovalEntry],
+        entries: impl AsRef<[ApprovalEntry]>,
     ) -> Result<Self, ApprovalError> {
+        let entries = entries.as_ref();
         let mut ledger = Self::new(config)?;
         for entry in entries {
             ledger
@@ -46,8 +49,17 @@ impl ApprovalLedger {
     pub fn revision(&self) -> u64 {
         self.sequence
     }
-    pub fn entries(&self) -> &[ApprovalEntry] {
-        &self.history
+    /// Copies the complete history for export; use latest_entry for incremental persistence.
+    pub fn entries(&self) -> Vec<ApprovalEntry> {
+        self.history
+            .iter()
+            .map(|entry| entry.as_ref().clone())
+            .collect()
+    }
+
+    /// The newest validated entry, without copying the history.
+    pub fn latest_entry(&self) -> Option<&ApprovalEntry> {
+        self.history.back().map(AsRef::as_ref)
     }
     pub fn get(&self, id: &str) -> Option<&ApprovalRecord> {
         self.records.get(id)
@@ -68,10 +80,12 @@ impl ApprovalLedger {
     ) -> Result<Prepared<Self, ApprovalEffect>, ApprovalError> {
         if matches!(
             &event,
-            ApprovalEvent::Changed {
-                change: ApprovalChange::Complete { .. },
-                ..
-            }
+            ApprovalEvent::Imported { .. }
+                | ApprovalEvent::OriginalAuthorityUncertain { .. }
+                | ApprovalEvent::Changed {
+                    change: ApprovalChange::Complete { .. },
+                    ..
+                }
         ) {
             return Err(ApprovalError::Invalid(
                 "completion requires an owned execution permit",
@@ -80,24 +94,25 @@ impl ApprovalLedger {
         self.prepare_internal(commit_id, event, current_policy, now)
     }
 
-    fn prepare_internal(
+    pub(super) fn prepare_internal(
         &self,
         commit_id: String,
         event: ApprovalEvent,
         current_policy: Option<&ApprovalPolicy>,
         now: u64,
     ) -> Result<Prepared<Self, ApprovalEffect>, ApprovalError> {
-        if self.recovery_required && !matches!(event, ApprovalEvent::Recover) {
+        if self.recovery_required
+            && !matches!(
+                event,
+                ApprovalEvent::Recover | ApprovalEvent::OriginalAuthorityUncertain { .. }
+            )
+        {
             return Err(ApprovalError::RecoveryRequired);
         }
-        if self
-            .history
-            .iter()
-            .any(|entry| entry.commit_id == commit_id)
-        {
+        if self.commit_ids.contains(&commit_id) {
             return Err(ApprovalError::Conflict);
         }
-        let input = serde_json::json!({"config":self.config,"history":self.history,"event":event,"current_policy":current_policy,"now":now,"recovery_required":self.recovery_required});
+        let input = serde_json::json!({"config":self.config,"prior_digest":self.digest,"event":event,"current_policy":current_policy,"now":now,"recovery_required":self.recovery_required});
         if let ApprovalEvent::Changed { request_id, change } = &event {
             let record = self
                 .records
@@ -126,6 +141,7 @@ impl ApprovalLedger {
             .checked_add(1)
             .ok_or(ApprovalError::Capacity)?;
         let entry = ApprovalEntry {
+            prior_digest: self.digest.clone(),
             commit_id: commit_id.clone(),
             sequence,
             now,
@@ -189,7 +205,7 @@ impl ApprovalLedger {
             commit_id,
             ApprovalEvent::Requested {
                 request: ApprovalRequest {
-                    request_id: format!("approval-{sequence:016x}"),
+                    request_id: self.request_id(sequence)?,
                     operation,
                     policy,
                     created_at: now,
@@ -240,18 +256,49 @@ impl ApprovalLedger {
     }
 
     fn install(&mut self, entry: ApprovalEntry) -> Result<Option<ApprovalRecord>, ApprovalError> {
+        if entry.prior_digest != self.digest {
+            return Err(ApprovalError::Conflict);
+        }
         if !crate::identity::valid_id(&entry.commit_id) {
             return Err(ApprovalError::Invalid("commit identity"));
         }
-        if self
-            .history
-            .iter()
-            .any(|previous| previous.commit_id == entry.commit_id)
+        if self.commit_ids.contains(&entry.commit_id)
             || self.sequence.checked_add(1) != Some(entry.sequence)
         {
             return Err(ApprovalError::Conflict);
         }
-        let record = if matches!(entry.event, ApprovalEvent::Recover) {
+        let record = if let ApprovalEvent::Imported { history } = &entry.event {
+            if self.sequence != 0 || self.records.len() != 0 || history.limits != self.config {
+                return Err(ApprovalError::Conflict);
+            }
+            let imported = legacy::validate_history(history, entry.now)?;
+            self.records = imported.records;
+            self.recovery_required = true;
+            None
+        } else if let ApprovalEvent::OriginalAuthorityUncertain { proof } = &entry.event {
+            let mut record = self
+                .records
+                .get(&proof.request_id)
+                .ok_or(ApprovalError::NotFound)?
+                .clone();
+            if record.revision != proof.revision
+                || record.request.operation != proof.operation
+                || record.state != ApprovalState::Approved
+                || entry.now < record.updated_at
+            {
+                return Err(ApprovalError::Conflict);
+            }
+            record.state = ApprovalState::Unknown;
+            record.revision = record
+                .revision
+                .checked_add(1)
+                .ok_or(ApprovalError::Capacity)?;
+            record.updated_at = entry.now;
+            record.note = Some("legacy workflow recorded an uncertain execution intent; no consumption is inferred".into());
+            self.records
+                .insert(proof.request_id.clone(), record.clone());
+            Some(record)
+        } else if matches!(entry.event, ApprovalEvent::Recover) {
             let mut recovered = Vec::new();
             for record in self.records.values() {
                 if entry.now < record.updated_at {
@@ -297,7 +344,9 @@ impl ApprovalLedger {
             Some(record)
         };
         self.sequence = entry.sequence;
-        self.history.push(entry);
+        self.digest = crate::binding::digest(&entry);
+        self.commit_ids.insert(entry.commit_id.clone());
+        self.history.push_back(std::sync::Arc::new(entry));
         Ok(record)
     }
 }

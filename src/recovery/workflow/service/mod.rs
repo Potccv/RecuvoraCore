@@ -1,10 +1,15 @@
 //! Pure recovery transitions and Host-owned commit/execution contracts.
 mod contract;
 mod engine;
+mod legacy;
 mod query;
 use crate::recovery::{approval, knowledge::*};
 pub use contract::*;
 pub use engine::*;
+pub use legacy::{
+    LegacyRecoveryRevision, LegacyRecoveryStage, LegacyRecoveryTask, RecoveryImport,
+    RecoveryImportData,
+};
 pub use query::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

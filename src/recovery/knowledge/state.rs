@@ -1,7 +1,8 @@
 //! Deterministic knowledge decisions; the Host owns all storage and serialization.
 use super::{validation, *};
+use crate::collections::Map;
 use crate::operation::Prepared;
-use std::collections::{BTreeMap, BTreeSet};
+use im::OrdSet;
 
 /// Validated authority built through proposals and confirmed Host commits.
 /// There is intentionally no unchecked deserialization constructor.
@@ -9,22 +10,26 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct KnowledgeState {
     pub(super) config: KnowledgeConfig,
     revision: u64,
-    pub(super) records: BTreeMap<String, KnowledgeRecord>,
-    pub(super) scripts: BTreeMap<(String, u64), ScriptArtifact>,
-    pub(super) cases: BTreeMap<String, (String, KnowledgeCase)>,
-    pub(super) quarantined: BTreeSet<(String, u64)>,
+    digest: String,
+    commit_ids: OrdSet<String>,
+    pub(super) records: Map<String, KnowledgeRecord>,
+    pub(super) scripts: Map<(String, u64), ScriptArtifact>,
+    pub(super) cases: Map<String, (String, KnowledgeCase)>,
+    pub(super) quarantined: OrdSet<(String, u64)>,
 }
 
 impl KnowledgeState {
     pub fn new(config: KnowledgeConfig) -> Result<Self, KnowledgeError> {
         config.validate()?;
         Ok(Self {
+            digest: crate::binding::digest(&("knowledge", &config)),
+            commit_ids: OrdSet::new(),
             config,
             revision: 0,
-            records: BTreeMap::new(),
-            scripts: BTreeMap::new(),
-            cases: BTreeMap::new(),
-            quarantined: BTreeSet::new(),
+            records: Map::new(),
+            scripts: Map::new(),
+            cases: Map::new(),
+            quarantined: OrdSet::new(),
         })
     }
 
@@ -39,16 +44,31 @@ impl KnowledgeState {
         commit_id: impl Into<String>,
         command: KnowledgeCommand,
     ) -> Result<Prepared<Self>, KnowledgeError> {
+        let commit_id = commit_id.into();
+        if self.commit_ids.contains(&commit_id) {
+            return Err(KnowledgeError::Conflict("commit identity reused".into()));
+        }
         let record = self.prepare_record(&command)?;
         let mut state = self.clone();
         if let Some(record) = record {
             state.install(record);
         }
+        if let KnowledgeCommand::ExpandCapacity { target, .. } = &command {
+            state.config = target.clone();
+        }
         state.revision = next(self.revision)?;
-        let input = serde_json::to_value((self.snapshot(), &command))
+        let input = serde_json::to_value((&self.digest, &self.config, &command))
             .map_err(|error| KnowledgeError::Invalid(error.to_string()))?;
+        let request = crate::operation::CommitRequest::new(
+            commit_id.clone(),
+            self.revision,
+            "knowledge".into(),
+            input.clone(),
+        )?;
+        state.digest = crate::binding::digest(&request);
+        state.commit_ids.insert(commit_id.clone());
         Ok(Prepared::new_bound(
-            commit_id.into(),
+            commit_id,
             self.revision,
             "knowledge".into(),
             input,
@@ -180,6 +200,17 @@ impl KnowledgeState {
         event: &KnowledgeCommand,
     ) -> Result<Option<KnowledgeRecord>, KnowledgeError> {
         match event {
+            KnowledgeCommand::ExpandCapacity { expected, target } => {
+                target.validate()?;
+                if expected != &self.config
+                    || target.max_records < expected.max_records
+                    || target.max_cases_per_record < expected.max_cases_per_record
+                    || target == expected
+                {
+                    return Err(KnowledgeError::Conflict("capacity expansion requires current configuration and strictly increased limits".into()));
+                }
+                Ok(None)
+            }
             KnowledgeCommand::UpsertCandidate(candidate) => {
                 validation::candidate(candidate)?;
                 if let Some(old) = self.records.get(&candidate.id) {
@@ -287,9 +318,9 @@ impl KnowledgeState {
     fn install(&mut self, record: KnowledgeRecord) {
         let script = &record.candidate.script;
         let key = (script.id.clone(), script.version);
-        self.scripts
-            .entry(key.clone())
-            .or_insert_with(|| script.clone());
+        if !self.scripts.contains_key(&key) {
+            self.scripts.insert(key.clone(), script.clone());
+        }
         if matches!(
             record.status,
             KnowledgeStatus::Failed | KnowledgeStatus::Unknown | KnowledgeStatus::Disabled
