@@ -5,7 +5,7 @@
 ## 统一 Harness 修复
 
 1. `Register` 登记当前活动故障，重复故障身份不会产生第二次修复，同目标非终态和 Unknown 阻塞新任务。
-2. Host 提供当前观察并调用 `RecoveryCommand::StartRepair`。Core 根据环境、故障指纹和关键词精确检索最多四条 `RepairExperience`，按检索顺序选择能完整放入请求的条目，组成 `HarnessRepairRequest`。完整请求 JSON 最多 32 KiB（`MAX_REPAIR_REQUEST_BYTES`）；超预算经验整条省略，后续较小条目仍可入选，不截断内部动作或证据。未命中或所有参考条目都超预算时经验列表为空。失败与 Unknown 经验可作为标明结果的参考；命中不授予执行权限，检索错误不能解释为未命中。
+2. Host 提供当前观察并调用 `RecoveryCommand::StartRepair`。Core 一致合并可信 `ProblemContext.conditions` 与 `TargetBinding.required_facts`，注入保留的 `fault_fingerprint`，再结合关键词精确检索 `RepairExperience`；同名条件值冲突或输入占用保留键会被拒绝。当前观察必须满足这些稳定条件，额外 facts 完整保留在请求中作为证据，但不自动成为经验条件。知识域返回全部匹配项后，流程按稳定顺序选择最多四条能完整放入请求的条目。完整请求 JSON 最多 32 KiB（`MAX_REPAIR_REQUEST_BYTES`）；超预算经验整条省略，后续较小条目仍可入选，不截断内部动作或证据。`matched_experience_count` 是预算筛选前的完整命中数，`experiences` 是实际附带项，因此空列表仍能区分未命中与命中项全部超预算。失败与 Unknown 经验可作为标明结果的参考；命中不授予执行权限，检索错误不能解释为未命中。
 3. 请求包含故障、观察、参考经验、逻辑 Harness、目标限制、工具预算和可信委托，并要求总结经验与评估脚本化。`approval.allowed_action_kinds` 必须显式包含 `repair_with_harness`；Core 提交完整请求后返回 `RequestApproval`。
 4. Host 在审批域保存原操作申请，再以 `ApprovalAttached` 绑定原审批。当前政策、审核身份与期限仍由审批域校验；Host 持有目标所有权和当前故障复核边界，消费一次许可后将其移入 `AuthorizeExecution`。流程提交确认后返回 `Execute`。
 5. Harness 内部工具调用由 Host 管理。会话最多允许一次具体变更；Host 在发送前提交 `RepairActionPrepared { action }`，其中 `RepairArtifact` 的种类必须属于 `target.allowed_action_kinds`，内容及前提受校验，来源绑定当前 Harness 和原操作。`RepairReceipt.execution_trace` 必须与已提交动作精确一致，也可以没有动作。
@@ -22,7 +22,7 @@ Host 提交 `BeginExperience` 后才取得 `SummarizeExperience`，使用独立�
 
 `ExperienceReport` 包含总结、经验教训、相关输入经验 ID 和 `Scriptability`。引用只能来自本次请求的经验列表。`Possible` 允许附带 `RepairArtifact` 候选；`NotSuitable` 和 `Undetermined` 必须说明原因且不带候选。候选只保留不可变内容，不继承本次业务验收、不产生许可；后续 Harness 仍需按当前事实判断适用性。
 
-Host 从 `pending_experiences()` 读取未交付任务，完成总结后调用 `ExperienceJob.record()`。生成的 `RepairExperience.actions` 来自已提交执行轨迹。Host 经知识域 `TrustedRepairExperience::attest` 和 `RecordExperience` 可靠保存经验后，再提交 `ExperienceDelivered`。相同经验身份只接受完全相同内容；成功、失败和 Unknown 分别保存，后来的成功不撤销早期隔离。
+Host 从 `pending_experiences()` 读取保留完整任务审计快照的未交付任务，完成总结后调用 `ExperienceJob.record()`。生成的经验条件使用与检索相同的稳定合并和故障指纹注入规则，不吸收观察中的额外动态 facts；`RepairExperience.actions` 来自已提交执行轨迹。Host 经知识域 `TrustedRepairExperience::attest` 和 `RecordExperience` 可靠保存经验后，再提交 `ExperienceDelivered`。相同经验身份只接受完全相同内容；成功、失败和 Unknown 分别保存，后来的成功不撤销早期隔离。
 
 Core 不调度总结或保存重试。知识容量或保存错误不改变任务执行结果，也不得通过删除失败经验、动作版本或更换幂等身份绕过。查询和容量细节见[知识接口](../src/recovery/knowledge/README.md)。
 

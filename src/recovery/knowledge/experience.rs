@@ -106,12 +106,10 @@ impl TrustedRepairExperience {
 }
 
 impl KnowledgeState {
-    /// Exact applicable experience, including failures as explicitly labelled evidence.
-    /// No returned item grants permission to execute a candidate script.
-    pub fn search_experiences(
-        &self,
+    pub(crate) fn matching_experiences<'a>(
+        &'a self,
         query: &KnowledgeQuery,
-    ) -> Result<Vec<RepairExperience>, KnowledgeError> {
+    ) -> Result<Vec<&'a RepairExperience>, KnowledgeError> {
         validation::query(query)?;
         let mut matches: Vec<_> = self
             .experiences
@@ -125,14 +123,26 @@ impl KnowledgeState {
                         .iter()
                         .all(|word| item.keywords.contains(word))
             })
-            .cloned()
             .collect();
         matches.sort_by(|a, b| {
             b.recorded_at_ms
                 .cmp(&a.recorded_at_ms)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        matches.truncate(query.limit);
         Ok(matches)
+    }
+
+    /// Exact applicable experience, including failures as explicitly labelled evidence.
+    /// No returned item grants permission to execute a candidate script.
+    pub fn search_experiences(
+        &self,
+        query: &KnowledgeQuery,
+    ) -> Result<Vec<RepairExperience>, KnowledgeError> {
+        Ok(self
+            .matching_experiences(query)?
+            .into_iter()
+            .take(query.limit)
+            .cloned()
+            .collect())
     }
 }

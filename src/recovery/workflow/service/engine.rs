@@ -1,5 +1,5 @@
 //! Deterministic workflow. All I/O, clocks, scheduling and commit CAS belong to Host.
-use super::contract::{evidence, facts};
+use super::contract::{FAULT_FINGERPRINT_CONDITION, evidence, facts, stable_conditions};
 use super::*;
 use crate::operation::{CommitRequest, Prepared};
 use approval::{ApprovalRecord, ApprovalState, ExecutionPermit};
@@ -263,10 +263,11 @@ impl RecoveryState {
                     keywords: task.problem.keywords.clone(),
                     limit: 4,
                 };
-                let experiences = knowledge.search_experiences(&query)?;
+                let experiences = knowledge.matching_experiences(&query)?;
                 let mut request = HarnessRepairRequest {
                     problem: task.problem,
                     observation,
+                    matched_experience_count: experiences.len(),
                     experiences: Vec::new(),
                     harness_id: self.config.execution_harness.clone(),
                     delegation: self.config.approval.delegation.clone(),
@@ -278,11 +279,19 @@ impl RecoveryState {
                 if !request.within_size_limit()? {
                     return Err(invalid("repair request exceeds context budget"));
                 }
+                let mut selected = Vec::with_capacity(4);
                 for experience in experiences {
-                    request.experiences.push(experience);
-                    if !request.within_size_limit()? {
-                        request.experiences.pop();
+                    if selected.len() == 4 {
+                        break;
                     }
+                    selected.push(experience);
+                    if !request.within_size_limit_with(&selected)? {
+                        selected.pop();
+                    }
+                }
+                request.experiences = selected.into_iter().cloned().collect();
+                if !request.within_size_limit()? {
+                    return Err(invalid("repair request exceeds context budget"));
                 }
                 (
                     RecoveryEvent::RepairRequested {
@@ -512,17 +521,14 @@ impl RecoveryState {
         task: &RecoveryTask,
         observed: &TargetObservation,
     ) -> Result<BTreeMap<String, String>, RecoveryError> {
-        let mut values = observed.facts.clone();
-        if task
-            .problem
-            .conditions
+        let values = stable_conditions(&task.problem, &self.config.target)?;
+        if values
             .iter()
-            .any(|(k, v)| values.get(k) != Some(v))
+            .filter(|(key, _)| key.as_str() != FAULT_FINGERPRINT_CONDITION)
+            .any(|(key, value)| observed.facts.get(key) != Some(value))
         {
             return Err(invalid("incident environment changed"));
         }
-        values.insert("fault_fingerprint".into(), task.problem.fingerprint.clone());
-        facts(&values)?;
         Ok(values)
     }
     fn validate_action(
@@ -647,6 +653,9 @@ impl RecoveryState {
                     || serde_json::to_value(&request.target).ok()
                         != serde_json::to_value(&self.config.target).ok()
                     || request.max_tool_calls != self.config.max_tool_calls
+                    || request.matched_experience_count > MAX_MATCHED_EXPERIENCES
+                    || request.matched_experience_count < request.experiences.len()
+                    || (request.matched_experience_count == 0 && !request.experiences.is_empty())
                     || request.experiences.len() > 4
                     || !request.within_size_limit()?
                     || !request.summarize_experience
@@ -655,9 +664,30 @@ impl RecoveryState {
                     return Err(invalid("invalid unified repair request"));
                 }
                 self.observe(&request.observation, now)?;
-                self.conditions(&task, &request.observation)?;
+                let conditions = self.conditions(&task, &request.observation)?;
+                let mut ids = BTreeSet::new();
                 for item in &request.experiences {
                     TrustedRepairExperience::attest(item.clone())?;
+                    if !ids.insert(&item.id)
+                        || item
+                            .conditions
+                            .iter()
+                            .any(|(key, value)| conditions.get(key) != Some(value))
+                        || task
+                            .problem
+                            .keywords
+                            .iter()
+                            .any(|word| !item.keywords.contains(word))
+                    {
+                        return Err(invalid("repair experience does not match current problem"));
+                    }
+                }
+                if request.experiences.windows(2).any(|items| {
+                    items[0].recorded_at_ms < items[1].recorded_at_ms
+                        || (items[0].recorded_at_ms == items[1].recorded_at_ms
+                            && items[0].id > items[1].id)
+                }) {
+                    return Err(invalid("repair experiences are not stably ordered"));
                 }
                 let operation = approval::ProposedOperation {
                     task_id: task.id.clone(),
@@ -795,6 +825,7 @@ impl RecoveryState {
         match event {
             RecoveryEvent::Register { problem, incident } => {
                 problem.validate()?;
+                stable_conditions(problem, &self.config.target)?;
                 if problem.target_id != self.config.target.target_id {
                     return Err(invalid("wrong target"));
                 }

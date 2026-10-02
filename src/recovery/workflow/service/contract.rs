@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) const FAULT_FINGERPRINT_CONDITION: &str = "fault_fingerprint";
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TargetBinding {
@@ -50,6 +52,10 @@ impl RecoveryConfig {
             || kinds.len() > 32
             || kinds.iter().any(|kind| !crate::identity::valid_id(kind))
             || kinds.iter().collect::<BTreeSet<_>>().len() != kinds.len()
+            || self
+                .target
+                .required_facts
+                .contains_key(FAULT_FINGERPRINT_CONDITION)
         {
             return Err(invalid("invalid recovery limits or action scope"));
         }
@@ -104,8 +110,37 @@ impl ProblemContext {
             }
         }
         facts(&self.conditions)?;
+        if self.conditions.contains_key(FAULT_FINGERPRINT_CONDITION) {
+            return Err(invalid("fault fingerprint condition is reserved"));
+        }
         evidence(&self.evidence_refs)
     }
+}
+
+pub(super) fn stable_conditions(
+    problem: &ProblemContext,
+    target: &TargetBinding,
+) -> Result<BTreeMap<String, String>, RecoveryError> {
+    if problem.conditions.contains_key(FAULT_FINGERPRINT_CONDITION)
+        || target
+            .required_facts
+            .contains_key(FAULT_FINGERPRINT_CONDITION)
+    {
+        return Err(invalid("fault fingerprint condition is reserved"));
+    }
+    let mut values = problem.conditions.clone();
+    for (key, value) in &target.required_facts {
+        if values.get(key).is_some_and(|existing| existing != value) {
+            return Err(invalid("problem and target conditions conflict"));
+        }
+        values.insert(key.clone(), value.clone());
+    }
+    values.insert(
+        FAULT_FINGERPRINT_CONDITION.into(),
+        problem.fingerprint.clone(),
+    );
+    facts(&values)?;
+    Ok(values)
 }
 
 pub(super) fn facts(values: &BTreeMap<String, String>) -> Result<(), RecoveryError> {

@@ -787,6 +787,7 @@ fn unified_started() -> (Flow, String, ExecutionPermit) {
     let op = flow.task().operation.clone().unwrap();
     let request: HarnessRepairRequest =
         serde_json::from_value(op.action["request"].clone()).unwrap();
+    assert_eq!(request.matched_experience_count, 0);
     assert!(request.experiences.is_empty());
     assert!(request.summarize_experience && request.assess_scriptability);
     let id = flow.attach_and_approve(op);
@@ -826,6 +827,13 @@ fn unified_repair_supports_script_free_experience_and_matches_it_next_time() {
     assert_eq!(flow.task().stage, RecoveryStage::Completed);
     let job = summarize(&mut flow);
     let experience = job.record().unwrap();
+    assert_eq!(
+        experience.conditions,
+        BTreeMap::from([
+            ("environment".into(), "test".into()),
+            ("fault_fingerprint".into(), "fault".into()),
+        ])
+    );
     let pending = flow
         .knowledge
         .propose(
@@ -857,7 +865,195 @@ fn unified_repair_supports_script_free_experience_and_matches_it_next_time() {
     let request: HarnessRepairRequest =
         serde_json::from_value(flow.task().operation.as_ref().unwrap().action["request"].clone())
             .unwrap();
+    assert_eq!(request.matched_experience_count, 1);
     assert_eq!(request.experiences, vec![experience]);
+}
+
+#[test]
+fn stable_conditions_match_and_record_without_dynamic_observation_facts() {
+    let mut flow = Flow::new();
+    let stable_conditions = BTreeMap::from([
+        ("environment".into(), "test".into()),
+        ("failure_mode".into(), "unresponsive".into()),
+        ("fault_fingerprint".into(), "fault".into()),
+    ]);
+    let reference = RepairExperience {
+        id: "stable-reference".into(),
+        operation_id: "prior-operation".into(),
+        target_id: "target".into(),
+        conditions: stable_conditions.clone(),
+        keywords: vec!["workload".into()],
+        outcome: RepairOutcome::Verified,
+        evidence_refs: vec!["business:prior".into()],
+        recorded_at_ms: 1,
+        actions: Vec::new(),
+        report: report_without_script(),
+    };
+    flow.knowledge = commit(
+        flow.knowledge
+            .propose(
+                "stable-reference",
+                KnowledgeCommand::RecordExperience(
+                    TrustedRepairExperience::attest(reference.clone()).unwrap(),
+                ),
+            )
+            .unwrap(),
+    )
+    .0;
+
+    let mut context = problem("stable-incident");
+    context.conditions = BTreeMap::from([("failure_mode".into(), "unresponsive".into())]);
+    flow.step(RecoveryEvent::Register {
+        problem: context,
+        incident: IncidentEvidence {
+            incident_id: "stable-incident".into(),
+            revision: 1,
+            active: true,
+        },
+    });
+    flow.id = flow.state.tasks().next().unwrap().id.clone();
+    let mut observed = observation();
+    observed
+        .facts
+        .insert("failure_mode".into(), "unresponsive".into());
+    observed
+        .facts
+        .insert("sample_id".into(), "sample-start".into());
+    let pending = flow
+        .state
+        .prepare(
+            "stable-start",
+            RecoveryCommand::StartRepair {
+                task_id: flow.id.clone(),
+                revision: flow.task().revision,
+                observation: observed,
+            },
+            100_000,
+            &flow.knowledge,
+        )
+        .unwrap();
+    let (state, _) = commit(pending);
+    flow.state = state;
+    let operation = flow.task().operation.clone().unwrap();
+    let request: HarnessRepairRequest =
+        serde_json::from_value(operation.action["request"].clone()).unwrap();
+    assert_eq!(request.matched_experience_count, 1);
+    assert_eq!(request.experiences, vec![reference]);
+    assert_eq!(request.observation.facts["sample_id"], "sample-start");
+
+    let approval_id = flow.attach_and_approve(operation);
+    let permit = flow.consume(&approval_id);
+    let mut authorization = flow.authorization(permit, &approval_id);
+    if let RecoveryCommand::AuthorizeExecution { observation, .. } = &mut authorization {
+        observation
+            .facts
+            .insert("failure_mode".into(), "unresponsive".into());
+        observation
+            .facts
+            .insert("sample_id".into(), "sample-execution".into());
+    }
+    let pending = flow
+        .state
+        .prepare("stable-dispatch", authorization, 100_000, &flow.knowledge)
+        .unwrap();
+    let (state, mut effects) = commit(pending);
+    flow.state = state;
+    let RecoveryEffect::Execute { permit, .. } = effects.remove(0) else {
+        panic!("dispatch effect")
+    };
+    flow.record(permit, ExecutionOutcome::Executed);
+    flow.verify(Some(true));
+    let recorded = summarize(&mut flow).record().unwrap();
+    assert_eq!(recorded.conditions, stable_conditions);
+    assert_eq!(
+        flow.task().observation.as_ref().unwrap().facts["sample_id"],
+        "sample-execution"
+    );
+}
+
+#[test]
+fn stable_condition_conflicts_and_reserved_fingerprint_are_rejected() {
+    let knowledge = KnowledgeState::new(KnowledgeConfig::default()).unwrap();
+    let state = RecoveryState::new(config()).unwrap();
+    let mut conflict = problem("condition-conflict");
+    conflict
+        .conditions
+        .insert("environment".into(), "production".into());
+    assert!(
+        state
+            .prepare(
+                "condition-conflict",
+                RecoveryCommand::Event(RecoveryEvent::Register {
+                    problem: conflict,
+                    incident: IncidentEvidence {
+                        incident_id: "condition-conflict".into(),
+                        revision: 1,
+                        active: true,
+                    },
+                }),
+                100_000,
+                &knowledge,
+            )
+            .is_err()
+    );
+    assert_eq!(state.tasks().count(), 0);
+    assert!(state.entries().is_empty());
+
+    let mut reserved = problem("reserved-fingerprint");
+    reserved
+        .conditions
+        .insert("fault_fingerprint".into(), "forged".into());
+    assert!(
+        state
+            .prepare(
+                "reserved-fingerprint",
+                RecoveryCommand::Event(RecoveryEvent::Register {
+                    problem: reserved,
+                    incident: IncidentEvidence {
+                        incident_id: "reserved-fingerprint".into(),
+                        revision: 1,
+                        active: true,
+                    },
+                }),
+                100_000,
+                &knowledge,
+            )
+            .is_err()
+    );
+    assert_eq!(state.tasks().count(), 0);
+    assert!(state.entries().is_empty());
+
+    let mut settings = config();
+    settings
+        .target
+        .required_facts
+        .insert("fault_fingerprint".into(), "forged".into());
+    assert!(RecoveryState::new(settings).is_err());
+
+    let mut settings = config();
+    settings.target.required_facts = (0..32)
+        .map(|index| (format!("required-{index:02}"), "value".into()))
+        .collect();
+    let state = RecoveryState::new(settings).unwrap();
+    assert!(
+        state
+            .prepare(
+                "condition-capacity",
+                RecoveryCommand::Event(RecoveryEvent::Register {
+                    problem: problem("condition-capacity"),
+                    incident: IncidentEvidence {
+                        incident_id: "condition-capacity".into(),
+                        revision: 1,
+                        active: true,
+                    },
+                }),
+                100_000,
+                &knowledge,
+            )
+            .is_err()
+    );
+    assert_eq!(state.tasks().count(), 0);
+    assert!(state.entries().is_empty());
 }
 #[test]
 fn summary_failure_and_restart_do_not_change_result_or_reissue_execution() {
@@ -1262,6 +1458,7 @@ fn large_matching_experiences_are_selected_whole_within_request_budget() {
             Vec::new()
         };
         assert_eq!(request.experiences, expected);
+        assert_eq!(request.matched_experience_count, 4);
         assert_eq!(flow.knowledge.snapshot().experiences.len(), 4);
         let restored = RecoveryState::restore(config(), flow.state.entries()).unwrap();
         assert_eq!(
@@ -1302,4 +1499,203 @@ fn oversized_required_repair_context_is_rejected_without_mutation() {
     );
     assert_eq!(flow.task().stage, RecoveryStage::Queued);
     assert!(flow.task().operation.is_none());
+}
+
+fn reference_experience(id: &str, payload: &str) -> RepairExperience {
+    let mut conditions = facts();
+    conditions.insert("fault_fingerprint".into(), "fault".into());
+    let mut action = artifact(1);
+    action.id = format!("{id}-action");
+    action.payload = serde_json::Value::String(payload.into());
+    RepairExperience {
+        id: id.into(),
+        operation_id: format!("{id}-operation"),
+        target_id: "target".into(),
+        conditions,
+        keywords: vec!["workload".into()],
+        outcome: RepairOutcome::Verified,
+        evidence_refs: vec!["business:reference".into()],
+        recorded_at_ms: 1,
+        actions: vec![action],
+        report: report_without_script(),
+    }
+}
+
+fn add_reference(flow: &mut Flow, experience: RepairExperience) {
+    flow.knowledge = commit(
+        flow.knowledge
+            .propose(
+                format!("record-{}", experience.id),
+                KnowledgeCommand::RecordExperience(
+                    TrustedRepairExperience::attest(experience).unwrap(),
+                ),
+            )
+            .unwrap(),
+    )
+    .0;
+}
+
+#[test]
+fn experience_matching_ignores_dynamic_samples_but_requires_same_stable_values() {
+    let mut reference = reference_experience("stable", "small");
+    reference
+        .conditions
+        .insert("failure_mode".into(), "timeout".into());
+    for (sample, failure_mode, expected_count) in [
+        ("sample-1", "timeout", 1),
+        ("sample-2", "timeout", 1),
+        ("sample-2", "disconnected", 0),
+    ] {
+        let mut flow = Flow::new();
+        add_reference(&mut flow, reference.clone());
+        let mut context = problem("matching-incident");
+        context
+            .conditions
+            .insert("failure_mode".into(), failure_mode.into());
+        flow.step(RecoveryEvent::Register {
+            problem: context,
+            incident: IncidentEvidence {
+                incident_id: "matching-incident".into(),
+                revision: 1,
+                active: true,
+            },
+        });
+        flow.id = flow.state.tasks().next().unwrap().id.clone();
+        let mut observed = observation();
+        observed.facts.insert("sample_id".into(), sample.into());
+        observed
+            .facts
+            .insert("failure_mode".into(), failure_mode.into());
+        let pending = flow
+            .state
+            .prepare(
+                "matching-start",
+                RecoveryCommand::StartRepair {
+                    task_id: flow.id.clone(),
+                    revision: flow.task().revision,
+                    observation: observed,
+                },
+                100_000,
+                &flow.knowledge,
+            )
+            .unwrap();
+        flow.state = commit(pending).0;
+        let request: HarnessRepairRequest = serde_json::from_value(
+            flow.task().operation.as_ref().unwrap().action["request"].clone(),
+        )
+        .unwrap();
+        assert_eq!(request.matched_experience_count, expected_count);
+        assert_eq!(request.experiences.len(), expected_count);
+        assert_eq!(request.observation.facts["sample_id"], sample);
+    }
+}
+
+#[test]
+fn fifth_matching_experience_is_selected_after_four_oversized_references() {
+    let mut flow = Flow::new();
+    for index in 0..5 {
+        let size = if index < 4 {
+            MAX_ARTIFACT_BYTES - 2
+        } else {
+            64
+        };
+        let mut reference = reference_experience(&format!("reference-{index}"), &"x".repeat(size));
+        reference.recorded_at_ms = 5 - index;
+        add_reference(&mut flow, reference);
+    }
+    flow.register("fifth-reference");
+    let operation = flow.start();
+    let request: HarnessRepairRequest =
+        serde_json::from_value(operation.action["request"].clone()).unwrap();
+    assert_eq!(request.matched_experience_count, 5);
+    assert_eq!(request.experiences.len(), 1);
+    assert_eq!(request.experiences[0].id, "reference-4");
+    assert!(serde_json::to_vec(&request).unwrap().len() <= MAX_REPAIR_REQUEST_BYTES);
+    assert_eq!(flow.knowledge.snapshot().experiences.len(), 5);
+}
+
+#[test]
+fn complete_request_budget_counts_utf8_and_json_escapes_at_the_exact_boundary() {
+    let prefix = "恢复\n\"\\".repeat(100);
+    let request_for = |payload: &str| {
+        let mut flow = Flow::new();
+        add_reference(&mut flow, reference_experience("boundary", payload));
+        flow.register("boundary");
+        let operation = flow.start();
+        serde_json::from_value::<HarnessRepairRequest>(operation.action["request"].clone()).unwrap()
+    };
+    let small = request_for(&prefix);
+    assert_eq!(small.experiences.len(), 1);
+    let padding = MAX_REPAIR_REQUEST_BYTES - serde_json::to_vec(&small).unwrap().len();
+    let exact_payload = format!("{prefix}{}", "x".repeat(padding));
+    let exact = request_for(&exact_payload);
+    assert_eq!(
+        serde_json::to_vec(&exact).unwrap().len(),
+        MAX_REPAIR_REQUEST_BYTES
+    );
+    assert_eq!(exact.matched_experience_count, 1);
+    assert_eq!(exact.experiences[0].actions[0].payload, exact_payload);
+
+    let over = request_for(&format!("{exact_payload}x"));
+    assert_eq!(over.matched_experience_count, 1);
+    assert!(over.experiences.is_empty());
+}
+
+#[test]
+fn replay_revalidates_reference_count_order_and_applicability_with_bound_input() {
+    let mut flow = Flow::new();
+    add_reference(&mut flow, reference_experience("a", "small"));
+    add_reference(&mut flow, reference_experience("b", "small"));
+    flow.register("reference-history");
+    let before = flow.state.clone();
+    flow.start();
+    let original = flow.state.entries();
+    for case in 0..4 {
+        let mut entries = original.clone();
+        let entry = entries.last_mut().unwrap();
+        let RecoveryEvent::RepairRequested { request, .. } = &mut entry.event else {
+            panic!("repair request history")
+        };
+        match case {
+            0 => request.matched_experience_count = 1,
+            1 => request.experiences.reverse(),
+            2 => {
+                request.experiences[0]
+                    .conditions
+                    .insert("environment".into(), "different".into());
+            }
+            _ => request.experiences[1] = request.experiences[0].clone(),
+        }
+        // Preserve the full event binding so replay must reject its domain content.
+        entry.request.input[4] = serde_json::to_value(&entry.event).unwrap();
+        let event = entry.event.clone();
+        let result = RecoveryState::restore(config(), &entries);
+        assert!(matches!(result, Err(RecoveryError::Invalid(reason))
+            if reason != "recovery commit content differs from history"));
+        assert!(
+            before
+                .prepare(
+                    "invalid-reference",
+                    RecoveryCommand::Event(event),
+                    100_000,
+                    &flow.knowledge,
+                )
+                .is_err()
+        );
+    }
+    let restored = RecoveryState::restore(config(), &original).unwrap();
+    let pending = restored
+        .prepare(
+            "recover-reference",
+            RecoveryCommand::Event(RecoveryEvent::Recover),
+            100_000,
+            &flow.knowledge,
+        )
+        .unwrap();
+    let (restored, effects) = commit(pending);
+    assert!(effects.is_empty());
+    assert_eq!(
+        restored.task(&flow.id).unwrap().operation,
+        flow.task().operation
+    );
 }

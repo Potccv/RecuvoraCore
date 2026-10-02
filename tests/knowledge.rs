@@ -245,10 +245,14 @@ fn scriptless_experiences_and_candidates_do_not_create_execution_authority() {
 fn exact_matching_precedes_limits_with_stable_time_and_identity_order() {
     let mut state = initial();
     for (id, time, condition) in [
-        ("z", 300, "other"),
-        ("b", 200, "unready"),
-        ("a", 200, "unready"),
-        ("c", 100, "unready"),
+        ("newest-non-match", 400, "other"),
+        ("d", 300, "unready"),
+        ("c", 300, "unready"),
+        ("b", 300, "unready"),
+        ("a", 300, "unready"),
+        ("f", 200, "unready"),
+        ("e", 200, "unready"),
+        ("oldest", 100, "unready"),
     ] {
         let mut item = experience(id, RepairOutcome::Unknown);
         item.recorded_at_ms = time;
@@ -256,7 +260,7 @@ fn exact_matching_precedes_limits_with_stable_time_and_identity_order() {
         state = commit(state, command(item));
     }
     let mut request = query();
-    request.limit = 2;
+    request.limit = 4;
     assert_eq!(
         state
             .search_experiences(&request)
@@ -264,7 +268,17 @@ fn exact_matching_precedes_limits_with_stable_time_and_identity_order() {
             .iter()
             .map(|v| v.id.as_str())
             .collect::<Vec<_>>(),
-        ["a", "b"]
+        ["a", "b", "c", "d"]
+    );
+    request.limit = 7;
+    assert_eq!(
+        state
+            .search_experiences(&request)
+            .unwrap()
+            .iter()
+            .map(|v| v.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b", "c", "d", "e", "f", "oldest"]
     );
     request.keywords.push("missing".into());
     assert!(state.search_experiences(&request).unwrap().is_empty());
