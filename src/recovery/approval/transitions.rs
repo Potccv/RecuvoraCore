@@ -8,29 +8,8 @@ impl ApprovalLedger {
         now: u64,
         sequence: u64,
     ) -> Result<ApprovalRecord, ApprovalError> {
-        self.apply_mode(event, now, sequence, false)
-    }
-
-    pub(super) fn apply_legacy(
-        &self,
-        event: &ApprovalEvent,
-        now: u64,
-        sequence: u64,
-    ) -> Result<ApprovalRecord, ApprovalError> {
-        self.apply_mode(event, now, sequence, true)
-    }
-
-    fn apply_mode(
-        &self,
-        event: &ApprovalEvent,
-        now: u64,
-        sequence: u64,
-        legacy: bool,
-    ) -> Result<ApprovalRecord, ApprovalError> {
         let (id, change) = match event {
-            ApprovalEvent::Recover
-            | ApprovalEvent::Imported { .. }
-            | ApprovalEvent::OriginalAuthorityUncertain { .. } => {
+            ApprovalEvent::Recover => {
                 return Err(ApprovalError::Invalid(
                     "recovery is an aggregate transition",
                 ));
@@ -41,7 +20,7 @@ impl ApprovalLedger {
                 if self.records.len() >= self.config.max_requests {
                     return Err(ApprovalError::Capacity);
                 }
-                if request.request_id != self.request_id(sequence)?
+                if request.request_id != format!("approval-{sequence:016x}")
                     || request.created_at != now
                     || request.created_at.checked_add(request.policy.ttl_secs)
                         != Some(request.expires_at)
@@ -91,26 +70,6 @@ impl ApprovalLedger {
         }
         let state = record.state;
         match change {
-            ApprovalChange::Assess { assessment } => {
-                if !legacy {
-                    return Err(ApprovalError::Invalid(
-                        "Harness results require a committed review attempt",
-                    ));
-                }
-                require_state(state, &[ApprovalState::Pending])?;
-                if record.review_stage != ReviewStage::ReadyHarness {
-                    return Err(ApprovalError::Conflict);
-                }
-                fresh(&record, now)?;
-                validate_assessment(assessment)?;
-                if !matches!((&record.request.policy.reviewer, &assessment.reviewer), (ReviewerConfig::Harness { harness_id }, AssessmentSource::Harness { harness_id: actual, .. }) if harness_id == actual)
-                {
-                    return Err(ApprovalError::Conflict);
-                }
-                record.state = decision_state(&record, assessment.decision)?;
-                record.assessment = Some(assessment.clone());
-                finish_review(&mut record);
-            }
             ApprovalChange::HumanDecision {
                 expected_revision,
                 assessment,

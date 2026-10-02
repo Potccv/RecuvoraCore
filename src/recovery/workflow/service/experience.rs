@@ -1,5 +1,8 @@
 use super::*;
 
+/// Maximum serialized repair request, including fault, observation and references.
+pub const MAX_REPAIR_REQUEST_BYTES: usize = 32 * 1024;
+
 /// A single bounded repair session. Experience is reference material, not authority.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +16,14 @@ pub struct HarnessRepairRequest {
     pub max_tool_calls: usize,
     pub summarize_experience: bool,
     pub assess_scriptability: bool,
+}
+
+impl HarnessRepairRequest {
+    pub(super) fn within_size_limit(&self) -> Result<bool, RecoveryError> {
+        serde_json::to_vec(self)
+            .map(|encoded| encoded.len() <= MAX_REPAIR_REQUEST_BYTES)
+            .map_err(|_| invalid("cannot encode repair request"))
+    }
 }
 
 /// Persisted independently of business completion, with a stable delivery identity.
@@ -30,7 +41,7 @@ pub struct ExperienceJob {
     pub delivered: bool,
 }
 impl ExperienceJob {
-    pub fn record(&self, platform: &str) -> Result<RepairExperience, RecoveryError> {
+    pub fn record(&self) -> Result<RepairExperience, RecoveryError> {
         let operation = self
             .task
             .operation
@@ -52,7 +63,6 @@ impl ExperienceJob {
             "fault_fingerprint".into(),
             self.task.problem.fingerprint.clone(),
         );
-        conditions.insert("platform".into(), platform.into());
         Ok(RepairExperience {
             id: self.id.clone(),
             operation_id: operation.operation_id.clone(),
@@ -60,6 +70,7 @@ impl ExperienceJob {
             conditions,
             keywords: self.task.problem.keywords.clone(),
             outcome: self.outcome,
+            actions: receipt.execution_trace.clone(),
             evidence_refs: self.task.verification.as_ref().map_or_else(
                 || receipt.evidence_refs.clone(),
                 |v| v.evidence_refs.clone(),

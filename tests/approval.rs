@@ -260,9 +260,6 @@ fn human_denial_is_terminal_and_stale_revision_is_rejected() {
         .unwrap(),
     );
     for change in [
-        ApprovalChange::Assess {
-            assessment: harness(ApprovalDecision::Approve),
-        },
         ApprovalChange::BeginReview {
             expected_revision: 1,
             timeout_secs: 5,
@@ -760,59 +757,19 @@ fn receipt_binds_event_and_policy_even_with_same_id_and_revision() {
 }
 
 #[test]
-fn untracked_assessment_is_rejected_before_and_after_restart() {
-    let (ledger, id) = requested(&policy(), operation("op"));
-    let untracked = ApprovalChange::Assess {
-        assessment: harness(ApprovalDecision::Approve),
-    };
-    assert!(matches!(
-        changed(&ledger, &id, untracked.clone(), &policy(), 11),
-        Err(ApprovalError::Invalid(_))
-    ));
-    let restored = ApprovalLedger::restore(ApprovalLimits::default(), ledger.entries()).unwrap();
-    let (restored, effects) = install(restored.prepare_recovery("restart".into(), 20).unwrap());
-    assert!(effects.is_empty());
-    assert!(matches!(
-        changed(&restored, &id, untracked.clone(), &policy(), 90),
-        Err(ApprovalError::Invalid(_))
-    ));
-    assert_eq!(restored.get(&id).unwrap().review_attempt, 0);
-    let (reviewing, attempt) = begin(restored, &id, &policy(), 90);
-    assert!(matches!(
-        changed(
-            &reviewing,
-            &id,
-            ApprovalChange::AssessAttempt {
-                attempt: attempt.clone(),
-                assessment: harness(ApprovalDecision::Approve)
-            },
-            &policy(),
-            100
-        ),
-        Err(ApprovalError::ReviewTimedOut)
-    ));
-    let (approved, _) = install(
-        changed(
-            &reviewing,
-            &id,
-            ApprovalChange::AssessAttempt {
-                attempt,
-                assessment: harness(ApprovalDecision::Approve),
-            },
-            &policy(),
-            99,
+fn removed_untracked_assessment_and_import_are_rejected_at_decode() {
+    assert!(
+        serde_json::from_value::<ApprovalChange>(
+            serde_json::json!({"change":"assess","assessment":harness(ApprovalDecision::Approve)})
         )
-        .unwrap(),
+        .is_err()
     );
-    let mut history = approved.entries();
-    history.last_mut().unwrap().event = ApprovalEvent::Changed {
-        request_id: id.clone(),
-        change: untracked,
-    };
-    assert!(ApprovalLedger::restore(ApprovalLimits::default(), history).is_err());
-    let mut history = approved.entries();
-    history[1].prior_digest = "0".repeat(64);
-    assert!(ApprovalLedger::restore(ApprovalLimits::default(), history).is_err());
+    assert!(
+        serde_json::from_value::<ApprovalEvent>(
+            serde_json::json!({"event":"imported","history":{}})
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -845,145 +802,4 @@ fn scale_approval_history_is_incremental_and_restores_without_permits() {
     println!(
         "scale approval n=500 max_request={largest} history_bytes={bytes} prepare={prepare:?} restore={restore:?}"
     );
-}
-
-fn legacy_history() -> Vec<LegacyApprovalEntry> {
-    vec![
-        LegacyApprovalEntry {
-            sequence: 1,
-            now: 10,
-            event: json!({"event":"requested","request":{"request_id":"approval-0000000000000001","operation":operation("legacy"),"policy":policy(),"created_at":10,"expires_at":110}}),
-        },
-        LegacyApprovalEntry {
-            sequence: 2,
-            now: 11,
-            event: json!({"event":"changed","request_id":"approval-0000000000000001","change":{"change":"assess","assessment":harness(ApprovalDecision::Approve)}}),
-        },
-        LegacyApprovalEntry {
-            sequence: 3,
-            now: 12,
-            event: json!({"event":"changed","request_id":"approval-0000000000000001","change":{"change":"consume"}}),
-        },
-        LegacyApprovalEntry {
-            sequence: 4,
-            now: 13,
-            event: json!({"event":"changed","request_id":"approval-0000000000000001","change":{"change":"complete","outcome":"executed","reason":"original receipt"}}),
-        },
-    ]
-}
-
-#[test]
-fn legacy_import_preserves_unattempted_assessment_and_consumption_without_effects() {
-    let original = ApprovalLedger::new(ApprovalLimits::default()).unwrap();
-    let proposal = original
-        .prepare_import(
-            "import".into(),
-            ApprovalImport::validate(ApprovalLimits::default(), legacy_history()).unwrap(),
-            14,
-        )
-        .unwrap();
-    assert!(original.list().is_empty());
-    let (ledger, effects) = install(proposal);
-    assert!(effects.is_empty());
-    let record = ledger.get("approval-0000000000000001").unwrap();
-    assert_eq!(record.state, ApprovalState::Executed);
-    assert_eq!(record.revision, 3);
-    assert_eq!(record.review_attempt, 0);
-    assert!(ledger.recovery_required());
-    assert!(
-        ledger
-            .prepare(
-                "bypass".into(),
-                ledger.latest_entry().unwrap().event.clone(),
-                None,
-                14
-            )
-            .is_err()
-    );
-    let restored = ApprovalLedger::restore(ApprovalLimits::default(), ledger.entries()).unwrap();
-    assert_eq!(
-        serde_json::to_value(restored.list()).unwrap(),
-        serde_json::to_value(ledger.list()).unwrap()
-    );
-    let (restored, effects) = install(restored.prepare_recovery("recover".into(), 14).unwrap());
-    assert!(effects.is_empty());
-    assert!(
-        restored
-            .prepare_import(
-                "second-import".into(),
-                ApprovalImport::validate(ApprovalLimits::default(), legacy_history()).unwrap(),
-                14
-            )
-            .is_err()
-    );
-}
-
-#[test]
-fn legacy_import_checks_history_policy_deadlines_and_commit_binding() {
-    for corruption in 0..5 {
-        let mut history = legacy_history();
-        match corruption {
-            0 => history[2].sequence = 9,
-            1 => history[1].now = 110,
-            2 => {
-                history[1].event["change"]["assessment"]["reviewer"]["harness_id"] = json!("other")
-            }
-            3 => history[0].event["request"]["policy"]["allowed_targets"] = json!(["different"]),
-            _ => {
-                history.remove(2);
-                history[2].sequence = 3;
-            }
-        }
-        assert!(ApprovalImport::validate(ApprovalLimits::default(), history).is_err());
-    }
-    let ledger = ApprovalLedger::new(ApprovalLimits::default()).unwrap();
-    let proposal = ledger
-        .prepare_import(
-            "import".into(),
-            ApprovalImport::validate(ApprovalLimits::default(), legacy_history()).unwrap(),
-            14,
-        )
-        .unwrap();
-    let mut binding = proposal.request().clone();
-    binding.input = json!({"truncated":true});
-    assert!(
-        proposal
-            .confirm(CommitReceipt::confirmed(&binding))
-            .is_err()
-    );
-}
-
-#[test]
-fn imported_request_id_collision_is_skipped_and_human_revision_is_preserved() {
-    let mut history = legacy_history();
-    history[1].event["change"] =
-        json!({"change":"human_decision","assessment":human(ApprovalDecision::Deny)});
-    history.truncate(2);
-    history.push(LegacyApprovalEntry {sequence:3,now:12,event:json!({"event":"requested","request":{"request_id":"approval-0000000000000003","operation":operation("second"),"policy":policy(),"created_at":12,"expires_at":112}})});
-    let ledger = ApprovalLedger::new(ApprovalLimits::default()).unwrap();
-    let (ledger, _) = install(
-        ledger
-            .prepare_import(
-                "import".into(),
-                ApprovalImport::validate(ApprovalLimits::default(), history).unwrap(),
-                14,
-            )
-            .unwrap(),
-    );
-    assert_eq!(ledger.get("approval-0000000000000001").unwrap().revision, 1);
-    let (ledger, _) = install(ledger.prepare_recovery("recover".into(), 14).unwrap());
-    let (ledger, _) = install(
-        ledger
-            .prepare_request("fresh".into(), operation("fresh"), policy(), 15)
-            .unwrap(),
-    );
-    assert_eq!(
-        ledger
-            .find_operation("task", "fresh")
-            .unwrap()
-            .request
-            .request_id,
-        "approval-0000000000000004"
-    );
-    assert_eq!(ledger.list().len(), 3);
 }

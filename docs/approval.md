@@ -4,7 +4,7 @@
 
 ## 决定与身份
 
-人工与指定 Harness 的审核均受当前硬政策限制。Host 认证调用者并限制 API 访问，`actor`、Harness 和会话身份用于归属与审计，不是认证凭据。模型提供评估内容，Host 绑定可信审核来源和具体尝试；迟到结果不能替换当前审核。Harness 结果必须使用已提交 `BeginReview` 返回的尝试调用 `AssessAttempt`；普通 `Assess` 在实时和普通历史校验中都被拒绝；完整旧历史仅经[专用导入验证](../src/recovery/approval/README.md#完整旧历史导入)保留当时事实，不重新产生审核或许可。
+人工与指定 Harness 的审核均受当前硬政策限制。Host 认证调用者并限制 API 访问，`actor`、Harness 和会话身份用于归属与审计，不是认证凭据。模型提供评估内容，Host 绑定可信审核来源和具体尝试；迟到结果不能替换当前审核。Harness 结果必须使用已提交 `BeginReview` 返回的尝试调用 `AssessAttempt`；协议不提供无审核尝试的评估入口。
 
 `prepare_request` 保留完整 `ProposedOperation` 和 `ApprovalPolicy`，`find_operation` 用原任务及操作身份查找已有请求。Host 必须先提交恢复任务的操作意图，再创建或关联审批；审批记录存在不代表恢复域已经确认关联。
 
@@ -14,7 +14,7 @@
 
 `Consume` 校验当前政策、批准状态、完整操作和有效期，同一目标存在 Executing 或 Unknown 时拒绝新的消费。Host 原子提交并确认后得到 `ApprovalEffect::Execute(ExecutionPermit)`；该许可不可复制、不可反序列化，也不会由历史恢复再次生成。
 
-在恢复流程中，Host 把许可移入 `RecoveryCommand::AuthorizeExecution`，同时提供当前审批记录、目标观察、故障事实和所有权代次。Core 再次检查操作绑定、故障、环境、脚本版本及隔离状态；只有恢复提案也可靠提交并确认后，才产生 `RecoveryEffect::Execute`。
+在恢复流程中，Host 把许可移入 `RecoveryCommand::AuthorizeExecution`，同时提供当前审批记录、目标观察、故障事实和所有权代次。Core 再次检查操作绑定、故障、环境、动作范围及隔离状态；只有恢复提案也可靠提交并确认后，才产生 `RecoveryEffect::Execute`。
 
 Host 必须在审批消费、恢复授权和派发之间持续保护目标所有权与当前故障版本。实际执行由 Host 对接的能力模块完成；结果通过保留的原许可交给 `ApprovalLedger::prepare_complete`，先提交审批结果，再提交恢复域 `ExecutionRecorded`。不可用序列化审批记录替代许可构造直接执行。
 

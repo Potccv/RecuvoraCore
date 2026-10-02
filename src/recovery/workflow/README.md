@@ -4,5 +4,4 @@
 
 实现位于私有 [service](service/README.md) 模块。完整过程见[恢复流程](../../../docs/recovery.md)，开发规则见[AGENTS](AGENTS.md)。
 
-
-完整旧历史通过 `RecoveryImport::validate` 校验 `LegacyRecoveryRevision` 序列及原审批/知识证据，使用空聚合的 `prepare_import` 保存。导入保留原身份、revision、预算和历史隔离，无执行效果；不确定原审批必须先封锁，Publishing 保留原案例与时间。步骤与限制见[导入边界](../../../docs/host-boundary-migration.md#旧数据导入边界)。
+恢复入口只接收当前配置及当前事件历史，`StartRepair` 是唯一修复主流程；配置使用 `schema_version = 2`，严格拒绝未知字段。

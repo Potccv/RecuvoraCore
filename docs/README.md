@@ -6,9 +6,9 @@
 
 - 从源码开发：先读[开发指南](development.md)，再读[架构](architecture.md)和修改目录的局部 AGENTS。
 - 接入恢复流程：先读[架构](architecture.md)与[领域维护](domain-maintenance.md)，再读[恢复流程](recovery.md)和[审批](approval.md)。
-- 迁移旧调用方：阅读[0.1 到 0.2 的 Host 接入迁移](host-boundary-migration.md)。
+- 接入当前协议：阅读[Host 接入](host-boundary-migration.md)，配置与持久恢复使用当前 schema 2。
 - 核对现有能力和证据：查看[实现状态](implementation-status.md)和[测试与验证](testing.md)。
-- 跟进领域缺口：查看[已知问题](implementation-status.md#已知问题)中的 CORE-001 至 CORE-004、处理状态和回归证据。
+- 确认接入边界：查看[接入与验证限制](implementation-status.md#接入与验证限制)。
 
 ## 文档归属
 
@@ -19,8 +19,8 @@
 | [恢复流程](recovery.md) | 参考：阶段、显式恢复、审批关联、结果核实及经验交付 |
 | [审批与许可](approval.md) | 参考：硬政策、审核身份、两阶段授权和一次执行许可 |
 | [领域维护](domain-maintenance.md) | 参考：跨域提交顺序、目标所有权、故障轮次及历史维护 |
-| [Host 接入迁移](host-boundary-migration.md) | 接入指南：破坏性的 0.2 API 变化、Host 适配及旧数据导入边界 |
-| [实现状态](implementation-status.md) | 状态记录：当前能力、已知问题及处理状态、限制和已执行验证的范围 |
+| [Host 接入](host-boundary-migration.md) | 接入指南：当前协议、能力适配、提交顺序和历史恢复边界 |
+| [实现状态](implementation-status.md) | 状态记录：当前能力、接入限制和已执行验证的范围 |
 | [测试与验证](testing.md) | 参考：检查选择、资源范围与证据含义 |
 | [源码导航](../src/README.md) | 模块职责与所属 API 入口；[模块地图](module-map.md)保留导航路径 |
 

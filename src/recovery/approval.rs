@@ -5,7 +5,6 @@
 
 mod contract;
 mod ledger;
-mod legacy;
 mod transitions;
 
 use crate::operation::Prepared;
@@ -15,11 +14,6 @@ use std::sync::Arc;
 const MAX_ID: usize = 512;
 const MAX_REASON: usize = 8192;
 const MAX_ACTION: usize = 131_072;
-
-pub use legacy::{
-    ApprovalImport, ApprovalImportData, LegacyApprovalEntry, LegacyExecutionUncertainty,
-    LegacyUncertaintyData,
-};
 
 pub use contract::{
     ApprovalAssessment, ApprovalDecision, ApprovalError, ApprovalLimits, ApprovalPolicy,
@@ -63,14 +57,6 @@ pub struct ApprovalEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalEvent {
-    /// Validated complete historical import; only the dedicated capability API prepares it.
-    Imported {
-        history: ApprovalImportData,
-    },
-    /// Preserves uncertain old intent without fabricating a consumed permit.
-    OriginalAuthorityUncertain {
-        proof: LegacyUncertaintyData,
-    },
     /// Explicit Host restart recovery; never dispatches a stored intent.
     Recover,
     Requested {
@@ -85,10 +71,6 @@ pub enum ApprovalEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "change", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalChange {
-    /// Rejected in live and replay validation; use BeginReview / AssessAttempt.
-    Assess {
-        assessment: ApprovalAssessment,
-    },
     HumanDecision {
         expected_revision: u64,
         assessment: ApprovalAssessment,

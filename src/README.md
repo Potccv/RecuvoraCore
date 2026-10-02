@@ -5,6 +5,6 @@
 | 模块 | 入口与职责 |
 | --- | --- |
 | `operation` | [提交提案](operation.rs)：`Prepared`、绑定完整输入的 `CommitRequest`、可信提交回执及确认后效果 |
-| `recovery` | [恢复领域](recovery/README.md)：故障、审批、知识和恢复流程的纯逻辑 |
+| `recovery` | [恢复领域](recovery/README.md)：故障、审批、修复经验和统一 Harness 恢复流程的纯逻辑 |
 
 [identity.rs](identity.rs) 仅提供私有有界标识校验，不生成系统时间或进程相关身份，也不证明认证和目标归属。[binding.rs](binding.rs) 维护版本化的确定性历史摘要，[collections.rs](collections.rs) 为聚合提供共享不可变记录的有序集合；两者均不公开。规则见[源码规范](AGENTS.md)。

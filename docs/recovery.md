@@ -1,59 +1,47 @@
 # 恢复流程
 
-`RecoveryState` 计算流程，Host 加载和提交状态并执行操作意图。接口见[状态机实现](../src/recovery/workflow/service/README.md)，提交职责见[架构](architecture.md)。
+`RecoveryState` 计算单一目标的恢复流程，Host 加载和提交状态并执行操作意图。接口见[状态机实现](../src/recovery/workflow/service/README.md)，提交职责见[架构](architecture.md)。
 
 ## 统一 Harness 修复
 
-1. `Register` 登记当前活动故障，重复故障身份不会产生第二次修复，同目标非终态和 Unknown 继续阻塞。
-2. Host 提供当前观察并调用 `RecoveryCommand::StartRepair`。Core 根据环境、故障指纹和关键词精确检索最多四条经验，组成 `HarnessRepairRequest`；未命中时经验列表为空。已有脚本案例也可以作为参考，命中不授予执行权限。知识输入或检索错误不能解释为未命中。
-3. 请求包含故障、观察、参考经验、逻辑 Harness、目标限制、工具预算和可信委托，并要求总结经验与评估脚本化。`approval.allowed_action_kinds` 必须显式包含 `repair_with_harness`；Core 先提交完整请求，再沿现有审批和一次许可边界交由 Host 执行。
-4. Harness 内部诊断与工具调用由 Host 管理。当前接口允许一次有界变更动作；Host 在实际发送前提交 `RepairActionPrepared`，保存具体脚本及其归属，动作 ID 固定绑定原操作，第二个变更被拒绝。`ScriptReceipt.execution_trace` 必须与已提交动作一致。Core 不要求修复前存在可复用脚本或 `RepairPlan`。
-5. 执行结果及独立业务验收沿用 `ExecutionRecorded`、`VerificationRecorded` 和 Unknown 核实规则。实际动作失败或 Unknown 的版本隔离先与结果一并提交；恢复不重发动作，保存的动作内容仍可审计。
-6. 结果提交同时建立稳定的 `ExperienceJob`。Host 提交 `BeginExperience` 后才取得 `SummarizeExperience`，以独立只读 Harness 会话生成 `ExperienceReport`，回传 `ExperienceSummarized` 或 `ExperienceFailed`。回调绑定调用身份，恢复会使旧回调失效；总结失败不改变业务结果，也不重新执行修复。
-7. Host 从已完成总结的任务生成 `RepairExperience`，通过知识域的 `TrustedRepairExperience::attest` 与 `RecordExperience` 可靠提交后，再提交 `ExperienceDelivered`。经验身份固定，完全相同重试幂等；成功、失败和 Unknown 是独立保存的事实，后来的成功不撤销早期隔离。
+1. `Register` 登记当前活动故障，重复故障身份不会产生第二次修复，同目标非终态和 Unknown 阻塞新任务。
+2. Host 提供当前观察并调用 `RecoveryCommand::StartRepair`。Core 根据环境、故障指纹和关键词精确检索最多四条 `RepairExperience`，按检索顺序选择能完整放入请求的条目，组成 `HarnessRepairRequest`。完整请求 JSON 最多 32 KiB（`MAX_REPAIR_REQUEST_BYTES`）；超预算经验整条省略，后续较小条目仍可入选，不截断内部动作或证据。未命中或所有参考条目都超预算时经验列表为空。失败与 Unknown 经验可作为标明结果的参考；命中不授予执行权限，检索错误不能解释为未命中。
+3. 请求包含故障、观察、参考经验、逻辑 Harness、目标限制、工具预算和可信委托，并要求总结经验与评估脚本化。`approval.allowed_action_kinds` 必须显式包含 `repair_with_harness`；Core 提交完整请求后返回 `RequestApproval`。
+4. Host 在审批域保存原操作申请，再以 `ApprovalAttached` 绑定原审批。当前政策、审核身份与期限仍由审批域校验；Host 持有目标所有权和当前故障复核边界，消费一次许可后将其移入 `AuthorizeExecution`。流程提交确认后返回 `Execute`。
+5. Harness 内部工具调用由 Host 管理。会话最多允许一次具体变更；Host 在发送前提交 `RepairActionPrepared { action }`，其中 `RepairArtifact` 的种类必须属于 `target.allowed_action_kinds`，内容及前提受校验，来源绑定当前 Harness 和原操作。`RepairReceipt.execution_trace` 必须与已提交动作精确一致，也可以没有动作。
+6. Host 先提交审批执行结果，再提交匹配的 `ExecutionRecorded`。`RepairExecutionOutcome::Executed` 产生 `Verify`，独立业务验收成功且执行者确认停止才得到 `Completed`。明确失败结束为 `Failed`；无法确定执行或业务结果时进入 Unknown。
+7. 业务结果提交同时建立稳定 `ExperienceJob`，实际动作的失败或 Unknown 隔离也在该提交中保存。业务完成不等待总结，恢复不重新派发动作。
 
-`ExperienceReport` 包含总结、经验教训、使用或修正的输入经验 ID，以及 `Scriptability`。`Possible` 允许附带脚本候选；`NotSuitable` 与 `Undetermined` 必须说明原因且不带脚本。引用只能来自该次请求的经验列表。事后脚本候选只保留不可变内容，不进入已验证脚本检索、不继承本次业务验收、不产生许可；后续由 Harness 判断其适用性。
+不含参考经验的必需请求内容已经超过预算时，准备返回结构化错误，原任务不变；调用方须提供有界的故障和观察输入。
 
-`pending_experiences()` 与 `pending_deliveries()` 分别提供新总结工作和旧案例交付。Host 应分别重试总结与保存，保留已成功部分；Core 不进行调度，也不把经验服务可用性作为已经完成业务的终态条件。
+配置只接受 `schema_version = 2`。`TargetBinding` 保存逻辑目标、执行者、动作范围、业务验收配置、必需事实和动作超时。Core 不解释动作 payload 的语言、平台或具体提供方；Host 实施调用预算、超时、能力路由及实际动作。
 
-## 兼容脚本流程
+## 独立总结与经验交付
 
-以下路径用于已有脚本方案和未切换委托的接入方。新统一修复入口不经过前置脚本生成或按故障轮次自动选择脚本。
+Host 提交 `BeginExperience` 后才取得 `SummarizeExperience`，使用独立只读 Harness 会话生成 `ExperienceReport`，回传 `ExperienceSummarized` 或 `ExperienceFailed`。回调绑定调用身份，候选生成来源绑定总结 Harness 和 call ID；重启使旧回调失效。总结失败保留同一经验身份，重试增加尝试次数，不改变业务结果或重新执行修复。
 
+`ExperienceReport` 包含总结、经验教训、相关输入经验 ID 和 `Scriptability`。引用只能来自本次请求的经验列表。`Possible` 允许附带 `RepairArtifact` 候选；`NotSuitable` 和 `Undetermined` 必须说明原因且不带候选。候选只保留不可变内容，不继承本次业务验收、不产生许可；后续 Harness 仍需按当前事实判断适用性。
 
-1. `Register` 根据当前活动故障登记任务。同一故障身份去重，同目标已有未结束任务拒绝新登记；独立故障轮次用于复用阈值。
-2. Host 检查环境并提供 `SelectPlan`。有效的本地已验证候选进入审批；无候选时，在提交中记录诊断次数和调用身份，确认后返回 `Diagnose`。
-3. `DiagnosisCompleted` 绑定效果中的任务版本和调用身份，校验脚本、环境和生成 Harness，提交完整 `ProposedOperation` 后输出 `RequestApproval`。
-4. Host 经审批域提交原操作申请，再用 `ApprovalAttached` 保存关联。人工或 Harness 决定均经审批域硬政策和期限校验；Host 负责审核转交时限与实际调用。
-5. Host 持有目标所有权和当前故障复核边界，经审批域消费一次许可，再以 `AuthorizeExecution` 准备流程派发。Host 提交确认后获得 `Execute`，实际执行一次，不能缓存或重放该效果。
-6. Host 先提交审批执行结果，再提交匹配的 `ExecutionRecorded`。明确执行成功产生 `Verify`；独立业务验收成功才得到 `Completed`。
-7. 成功、失败或 Unknown 同时生成稳定经验交付记录。明确成功/失败可以结束业务任务；经验保存通过 `pending_deliveries` 单独推进，`DeliveryConfirmed` 只确认交付。
+Host 从 `pending_experiences()` 读取未交付任务，完成总结后调用 `ExperienceJob.record()`。生成的 `RepairExperience.actions` 来自已提交执行轨迹。Host 经知识域 `TrustedRepairExperience::attest` 和 `RecordExperience` 可靠保存经验后，再提交 `ExperienceDelivered`。相同经验身份只接受完全相同内容；成功、失败和 Unknown 分别保存，后来的成功不撤销早期隔离。
 
-每一步的 `Prepared` 都必须经过 Host 可靠提交后才能确认。经验交付暂时失败不会阻塞已经完成任务的新故障；Unknown 仍阻塞目标，失败版本隔离不依赖经验交付成功。
+Core 不调度总结或保存重试。知识容量或保存错误不改变任务执行结果，也不得通过删除失败经验、动作版本或更换幂等身份绕过。查询和容量细节见[知识接口](../src/recovery/knowledge/README.md)。
 
 ## 审批关联恢复
 
-方案、观察、稳定操作和诊断预算先于审批申请保存。Host 重试原操作申请时不得更换身份或续期；审批域按操作与政策幂等。审批关联中断后，恢复流程先进入 Paused，`Resume` 返回原操作的申请意图，不重新诊断。已经消费许可的关联输入保留 Unknown 和版本隔离，不自动执行。
+完整 Harness 请求、观察与稳定操作先于审批申请保存。Host 重试原操作申请时不得更换身份或续期；审批域按完整操作与政策幂等。关联提交中断后，流程进入 Paused，显式 `Resume` 在关联缺失时返回原操作申请意图。已有关联则保留原审批和期限，不能创建新的执行机会。
+
+已消费或已终结审批在流程回执缺失时，通过 `ApprovalAttached` 或 `ApprovalResolved` 进入 Unknown 并保留原操作。审批拒绝、过期、取消或撤销终止当前申请，不产生替代修复流程。
 
 ## 重启与取消
 
-`restore` 只验证并重建历史，随后必须提交 `Recover`，才能进行其他状态变更。等待审批进入 Paused，需要当前任务版本显式 Resume；中断执行进入 Unknown 并保存隔离事实；中断诊断的次数保留，旧调用身份失效。审批域也需要独立的 `prepare_recovery`，中断审核转人工处理，不能接受旧审核回执。
+`restore` 只验证当前协议的完整历史并重建状态，随后必须提交 `Recover` 才接受其他变更。等待审批转 Paused，需要当前任务版本显式 Resume；中断执行转 Unknown，保存已提交动作及永久隔离。中断总结保留已消耗尝试次数并清除调用关联，迟到回调被拒绝。审批域另行通过 `prepare_recovery` 提交恢复事实，不重新发放已消费许可。
 
-Host 在恢复、取消或重试前负责协调仍在运行的外部调用，取消并等待其清理。没有进程监督或执行证据时，取消和网络断连不证明原执行者已停止。未派发任务取消时须先取消已关联审批；已经派发的任务必须核实结果。
+Host 在恢复、取消或重试前负责协调仍运行的外部调用。取消和网络断连不证明原执行者停止。未派发任务取消前须先取消已关联审批；已有操作但关联尚未解决时必须先核实原审批；已派发任务只能通过独立证据核实结果。
 
-## 重新诊断与结果核实
+## 结果核实
 
-Harness 判定复用方案不适用时，可以在原预算内生成替代方案；人工拒绝始终终态。复用动作明确失败或业务验收失败，且执行者确认停止后，可以重新诊断并申请新审批。新诊断方案执行失败进入 Failed。
+`ResultChecked` 分别接受绑定原操作的 `ExecutionResultCheck` 与 `BusinessVerification`。业务健康不能证明动作执行；执行者、操作、目标、验收配置、停止状态和证据新鲜度均需匹配。已确认的执行事实不能被后续相反结果覆盖。
 
-`ResultChecked` 分别接受绑定原操作的 `ExecutionResultCheck` 与 `BusinessVerification`，不能根据健康状态推断动作执行。审批仍为 Unknown 时，首先把独立证据准备并提交到流程中，任务保持 Unknown；Host 再按相同证据提交审批域 `Reconcile`，最后用当前任务版本再次提交 `ResultChecked` 完成流程。任一步中断均保留原事实、许可消费和隔离，不能重放动作。
+审批仍为 Unknown 时，先把独立证据提交到流程，任务保持 Unknown；Host 再按这些证据提交审批域 `Reconcile`，最后以当前任务版本、相同证据和更新审批事实再次提交 `ResultChecked`。任一步中断均保留原事实、许可消费和隔离，不重放动作。
 
-已确认未执行进入 Canceled，原许可仍保持已消费。已确认执行但业务验收未知继续 Unknown，可提供新的只读验收证据；后续成功保留历史 Unknown 的版本隔离。
-
-## 经验交付与维护
-
-经验候选和案例身份固定，Host 按顺序交付同一候选的历史结果，保留先前失败、Unknown 与隔离。仅在知识域明确提交后确认交付；知识容量错误不会改变任务执行结果，也不得通过删除案例或更换幂等键绕过。配置、历史导出和维护规则见[领域维护](domain-maintenance.md)。
-
-
-## 旧流程接入
-
-旧格式任务不能直接反序列化为 `RecoveryState`。Host 提供完整原历史，经 `RecoveryImport` 检查全部任务版本、审批、脚本和知识关联，再向空聚合提交导入。旧随机任务 ID 与操作 revision 保留；新任务生成身份时跳过已有身份。未消费待审批需显式 Resume，执行意图和不确定结果需独立核实；Publishing 以原案例身份和时间继续交付。完整步骤见[Host 接入迁移](host-boundary-migration.md#旧数据导入边界)。
+已确认未执行进入 Canceled，原许可保持已消费。已确认执行但业务验收未知继续 Unknown，可提供新的只读验收证据；后续成功仍保留历史 Unknown 的动作版本隔离。跨域顺序和维护约束见[领域维护](domain-maintenance.md)。

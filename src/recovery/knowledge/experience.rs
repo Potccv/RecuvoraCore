@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 pub enum Scriptability {
     Possible {
         reason: String,
-        candidate: Option<ScriptArtifact>,
+        candidate: Option<RepairArtifact>,
     },
     NotSuitable {
         reason: String,
@@ -43,8 +43,8 @@ impl ExperienceReport {
         }
         let reason = match &self.scriptability {
             Scriptability::Possible { reason, candidate } => {
-                if let Some(script) = candidate {
-                    validation::script(script)?;
+                if let Some(artifact) = candidate {
+                    artifact.validate()?;
                 }
                 reason
             }
@@ -67,15 +67,24 @@ pub struct RepairExperience {
     pub outcome: RepairOutcome,
     pub evidence_refs: Vec<String>,
     pub recorded_at_ms: u64,
+    pub actions: Vec<RepairArtifact>,
     pub report: ExperienceReport,
 }
 
 /// Only trusted Host code may attest a persisted result; model JSON cannot do so.
 #[derive(Clone, Debug, Serialize)]
-pub struct TrustedRepairExperience(RepairExperience);
+pub struct TrustedRepairExperience(Box<RepairExperience>);
 impl TrustedRepairExperience {
     pub fn attest(experience: RepairExperience) -> Result<Self, KnowledgeError> {
         experience.report.validate()?;
+        if experience.actions.len() > 1 {
+            return Err(KnowledgeError::Invalid(
+                "at most one repair action is allowed".into(),
+            ));
+        }
+        for action in &experience.actions {
+            action.validate()?;
+        }
         for id in [
             &experience.id,
             &experience.operation_id,
@@ -89,7 +98,7 @@ impl TrustedRepairExperience {
             limit: 1,
         })?;
         validation::evidence(&experience.evidence_refs)?;
-        Ok(Self(experience))
+        Ok(Self(Box::new(experience)))
     }
     pub fn record(&self) -> &RepairExperience {
         &self.0

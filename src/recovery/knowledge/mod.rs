@@ -1,7 +1,6 @@
-//! Pure recovery knowledge decisions. Scripts and external proposals never grant permits.
+//! Pure repair experience decisions. Artifacts and reports never grant permits.
 mod contract;
 mod query;
-mod source;
 mod state;
 mod validation;
 

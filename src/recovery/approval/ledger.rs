@@ -80,12 +80,10 @@ impl ApprovalLedger {
     ) -> Result<Prepared<Self, ApprovalEffect>, ApprovalError> {
         if matches!(
             &event,
-            ApprovalEvent::Imported { .. }
-                | ApprovalEvent::OriginalAuthorityUncertain { .. }
-                | ApprovalEvent::Changed {
-                    change: ApprovalChange::Complete { .. },
-                    ..
-                }
+            ApprovalEvent::Changed {
+                change: ApprovalChange::Complete { .. },
+                ..
+            }
         ) {
             return Err(ApprovalError::Invalid(
                 "completion requires an owned execution permit",
@@ -101,12 +99,7 @@ impl ApprovalLedger {
         current_policy: Option<&ApprovalPolicy>,
         now: u64,
     ) -> Result<Prepared<Self, ApprovalEffect>, ApprovalError> {
-        if self.recovery_required
-            && !matches!(
-                event,
-                ApprovalEvent::Recover | ApprovalEvent::OriginalAuthorityUncertain { .. }
-            )
-        {
+        if self.recovery_required && !matches!(event, ApprovalEvent::Recover) {
             return Err(ApprovalError::RecoveryRequired);
         }
         if self.commit_ids.contains(&commit_id) {
@@ -120,8 +113,7 @@ impl ApprovalLedger {
                 .ok_or(ApprovalError::NotFound)?;
             if matches!(
                 change,
-                ApprovalChange::Assess { .. }
-                    | ApprovalChange::HumanDecision { .. }
+                ApprovalChange::HumanDecision { .. }
                     | ApprovalChange::BeginReview { .. }
                     | ApprovalChange::AssessAttempt { .. }
                     | ApprovalChange::FailReview { .. }
@@ -205,7 +197,7 @@ impl ApprovalLedger {
             commit_id,
             ApprovalEvent::Requested {
                 request: ApprovalRequest {
-                    request_id: self.request_id(sequence)?,
+                    request_id: format!("approval-{sequence:016x}"),
                     operation,
                     policy,
                     created_at: now,
@@ -267,38 +259,7 @@ impl ApprovalLedger {
         {
             return Err(ApprovalError::Conflict);
         }
-        let record = if let ApprovalEvent::Imported { history } = &entry.event {
-            if self.sequence != 0 || self.records.len() != 0 || history.limits != self.config {
-                return Err(ApprovalError::Conflict);
-            }
-            let imported = legacy::validate_history(history, entry.now)?;
-            self.records = imported.records;
-            self.recovery_required = true;
-            None
-        } else if let ApprovalEvent::OriginalAuthorityUncertain { proof } = &entry.event {
-            let mut record = self
-                .records
-                .get(&proof.request_id)
-                .ok_or(ApprovalError::NotFound)?
-                .clone();
-            if record.revision != proof.revision
-                || record.request.operation != proof.operation
-                || record.state != ApprovalState::Approved
-                || entry.now < record.updated_at
-            {
-                return Err(ApprovalError::Conflict);
-            }
-            record.state = ApprovalState::Unknown;
-            record.revision = record
-                .revision
-                .checked_add(1)
-                .ok_or(ApprovalError::Capacity)?;
-            record.updated_at = entry.now;
-            record.note = Some("legacy workflow recorded an uncertain execution intent; no consumption is inferred".into());
-            self.records
-                .insert(proof.request_id.clone(), record.clone());
-            Some(record)
-        } else if matches!(entry.event, ApprovalEvent::Recover) {
+        let record = if matches!(entry.event, ApprovalEvent::Recover) {
             let mut recovered = Vec::new();
             for record in self.records.values() {
                 if entry.now < record.updated_at {

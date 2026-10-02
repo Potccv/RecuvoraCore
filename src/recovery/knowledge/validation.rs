@@ -1,4 +1,4 @@
-//! Bounded neutral data, immutable-script identity and verification binding checks.
+//! Bounded neutral content; concrete action formats belong to the Host.
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -52,106 +52,24 @@ pub(super) fn evidence(values: &[String]) -> Result<(), KnowledgeError> {
     strings(values, 32, 1024, "evidence references")
 }
 
-pub(super) fn candidate(value: &KnowledgeCandidate) -> Result<(), KnowledgeError> {
-    text(&value.id, 128, "record id")?;
-    text(&value.incident_id, 256, "incident id")?;
-    text(&value.summary, 4096, "summary")?;
-    strings(&value.keywords, 32, 128, "keywords")?;
-    conditions(&value.conditions)?;
-    evidence(&value.evidence_refs)?;
-    script(&value.script)?;
-    for (key, expected) in &value.script.preconditions {
-        if value
-            .conditions
-            .get(key)
-            .is_some_and(|actual| actual != expected)
-        {
-            return Err(KnowledgeError::Invalid(
-                "candidate and script preconditions conflict".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn script(script: &ScriptArtifact) -> Result<(), KnowledgeError> {
-    text(&script.id, 128, "script id")?;
-    if script.version == 0 {
+pub(super) fn artifact(value: &RepairArtifact) -> Result<(), KnowledgeError> {
+    text(&value.id, 128, "artifact id")?;
+    if value.version == 0 {
         return Err(KnowledgeError::Invalid(
-            "script version must be positive".into(),
+            "artifact version must be positive".into(),
         ));
     }
-    if !matches!(script.language.as_str(), "powershell" | "sh" | "python") {
+    text(&value.kind, 128, "artifact kind")?;
+    let payload = serde_json::to_vec(&value.payload)
+        .map_err(|error| KnowledgeError::Invalid(error.to_string()))?;
+    if payload.len() > MAX_ARTIFACT_BYTES {
         return Err(KnowledgeError::Invalid(
-            "unsupported script language label".into(),
+            "artifact payload exceeds bounds".into(),
         ));
     }
-    text(&script.platform, 64, "platform")?;
-    text(&script.source, MAX_SCRIPT_BYTES, "script source")?;
-    text(&script.generated_by_harness, 128, "generating Harness")?;
-    text(&script.generated_in_session, 256, "generating session")?;
-    conditions(&script.preconditions)?;
-    Ok(())
-}
-
-pub(super) fn verification(value: &BusinessVerificationRecord) -> Result<(), KnowledgeError> {
-    text(&value.operation_id, 256, "verification operation")?;
-    text(&value.target_id, 256, "verification target")?;
-    text(&value.script_id, 128, "verification script")?;
-    text(&value.verifier_id, 256, "trusted verifier")?;
-    if value.script_version == 0 {
-        return Err(KnowledgeError::Invalid(
-            "verification script version must be positive".into(),
-        ));
-    }
-    evidence(&value.evidence_refs)
-}
-
-pub(super) fn case(
-    value: &RepairCase,
-    proof: Option<&BusinessVerificationRecord>,
-    script: &ScriptArtifact,
-) -> Result<(), KnowledgeError> {
-    for (field, label) in [
-        (&value.id, "case id"),
-        (&value.operation_id, "operation id"),
-        (&value.target_id, "target id"),
-    ] {
-        text(field, 256, label)?;
-    }
-    evidence(&value.evidence_refs)?;
-    if value.script_id != script.id || value.script_version != script.version {
-        return Err(KnowledgeError::Conflict(
-            "case refers to another script version".into(),
-        ));
-    }
-    match (value.outcome, proof) {
-        (RepairOutcome::Verified, Some(proof)) => {
-            verification(proof)?;
-            if proof.operation_id != value.operation_id
-                || proof.target_id != value.target_id
-                || proof.script_id != value.script_id
-                || proof.script_version != value.script_version
-                || proof.verified_at_ms > value.recorded_at_ms
-            {
-                return Err(KnowledgeError::Conflict(
-                    "business verification does not match operation, target, script or time".into(),
-                ));
-            }
-        }
-        (RepairOutcome::Verified, None) => {
-            return Err(KnowledgeError::Invalid(
-                "verified outcome requires independent trusted business verification".into(),
-            ));
-        }
-        (_, Some(_)) => {
-            return Err(KnowledgeError::Invalid(
-                "non-verified outcome cannot carry successful verification".into(),
-            ));
-        }
-        (_, None) => {}
-    }
-    Ok(())
+    conditions(&value.preconditions)?;
+    text(&value.generated_by_harness, 128, "generating Harness")?;
+    text(&value.generated_in_session, 256, "generating session")
 }
 
 pub(super) fn query(value: &KnowledgeQuery) -> Result<(), KnowledgeError> {

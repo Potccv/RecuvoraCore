@@ -6,9 +6,7 @@ pub struct TargetBinding {
     pub target_id: String,
     /// Stable logical executor identity. Host owns how this identity is routed.
     pub executor_id: String,
-    pub platform: String,
-    pub allowed_languages: Vec<String>,
-    pub diagnostic_queries: Vec<String>,
+    pub allowed_action_kinds: Vec<String>,
     pub verification_profile: String,
     pub required_facts: BTreeMap<String, String>,
     pub action_timeout_secs: u64,
@@ -22,75 +20,51 @@ pub struct RecoveryConfig {
     pub execution_harness: String,
     pub target: TargetBinding,
     pub approval: approval::ApprovalPolicy,
-    /// Reuse always receives a fresh independent Harness review.
-    pub script_approval: approval::ApprovalPolicy,
-    pub diagnosis_timeout_secs: u64,
+    pub summary_timeout_secs: u64,
     pub review_timeout_secs: u64,
     pub max_tool_calls: usize,
-    pub max_diagnoses: u32,
-    /// Minimum distinct incident episodes, never the number of abnormal samples.
-    pub minimum_script_occurrences: u64,
     pub max_tasks: usize,
 }
 
 impl RecoveryConfig {
     pub fn validate(&self) -> Result<(), RecoveryError> {
         self.approval.validate()?;
-        self.script_approval.validate()?;
         for value in [
             &self.execution_harness,
             &self.target.target_id,
             &self.target.executor_id,
-            &self.target.platform,
             &self.target.verification_profile,
         ] {
             if !crate::identity::valid_id(value) {
-                return Err(RecoveryError::Invalid("invalid identity".into()));
+                return Err(invalid("invalid identity"));
             }
         }
-        if self.schema_version != 1
-            || !(1..=1800).contains(&self.diagnosis_timeout_secs)
+        let kinds = &self.target.allowed_action_kinds;
+        if self.schema_version != 2
+            || !(1..=1800).contains(&self.summary_timeout_secs)
             || !(1..=1800).contains(&self.review_timeout_secs)
             || !(1..=1800).contains(&self.target.action_timeout_secs)
             || !(1..=64).contains(&self.max_tool_calls)
-            || !(1..=8).contains(&self.max_diagnoses)
-            || !(1..=100_000).contains(&self.minimum_script_occurrences)
             || !(1..=10_000).contains(&self.max_tasks)
-            || self.target.allowed_languages.is_empty()
-            || self.target.allowed_languages.len() > 3
-            || self
-                .target
-                .allowed_languages
-                .iter()
-                .any(|v| !matches!(v.as_str(), "powershell" | "sh" | "python"))
-            || self.target.diagnostic_queries.is_empty()
-            || self.target.diagnostic_queries.len() > 32
-            || self
-                .target
-                .diagnostic_queries
-                .iter()
-                .any(|v| !crate::identity::valid_id(v))
-            || !matches!(
-                self.script_approval.reviewer,
-                approval::ReviewerConfig::Harness { .. }
-            )
+            || kinds.is_empty()
+            || kinds.len() > 32
+            || kinds.iter().any(|kind| !crate::identity::valid_id(kind))
+            || kinds.iter().collect::<BTreeSet<_>>().len() != kinds.len()
         {
-            return Err(RecoveryError::Invalid(
-                "invalid recovery limits or script review policy".into(),
-            ));
+            return Err(invalid("invalid recovery limits or action scope"));
         }
         facts(&self.target.required_facts)?;
-        for policy in [&self.approval, &self.script_approval] {
-            if !policy.allowed_targets.contains(&self.target.target_id)
-                || !policy
-                    .allowed_action_kinds
-                    .iter()
-                    .any(|kind| matches!(kind.as_str(), "execute_script" | "repair_with_harness"))
-            {
-                return Err(RecoveryError::Invalid(
-                    "target/script action not explicitly delegated".into(),
-                ));
-            }
+        if !self
+            .approval
+            .allowed_targets
+            .contains(&self.target.target_id)
+            || !self
+                .approval
+                .allowed_action_kinds
+                .iter()
+                .any(|kind| kind == "repair_with_harness")
+        {
+            return Err(invalid("target/Harness repair not explicitly delegated"));
         }
         Ok(())
     }
@@ -171,17 +145,9 @@ pub struct TargetObservation {
     pub observed_at_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RepairPlan {
-    pub summary: String,
-    pub script: ScriptArtifact,
-    pub reusable: bool,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ScriptOutcome {
+pub enum RepairExecutionOutcome {
     Executed,
     Failed,
     Unknown,
@@ -190,13 +156,13 @@ pub enum ScriptOutcome {
 /// Domain result returned by the external executor through the Host adapter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ScriptReceipt {
+pub struct RepairReceipt {
     /// Actual actions supplied by the trusted backend, never by the model's final text.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub execution_trace: Vec<ScriptArtifact>,
+    pub execution_trace: Vec<RepairArtifact>,
     pub operation_id: String,
     pub target_id: String,
-    pub outcome: ScriptOutcome,
+    pub outcome: RepairExecutionOutcome,
     pub executor_stopped: bool,
     pub evidence_refs: Vec<String>,
     pub summary: String,
@@ -206,7 +172,6 @@ pub struct ScriptReceipt {
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryStage {
     Queued,
-    Diagnosing,
     AwaitingApproval,
     Executing,
     Verifying,
@@ -232,20 +197,12 @@ pub struct RecoveryTask {
     pub id: String,
     pub revision: u64,
     pub problem: ProblemContext,
-    /// Trusted number of distinct matching incident episodes recorded by this store.
-    /// Legacy logs are normalized from incident identities during validated replay.
-    #[serde(default)]
-    pub episode_count: u64,
     pub stage: RecoveryStage,
-    pub diagnosis_attempts: u32,
-    pub plan: Option<RepairPlan>,
-    pub knowledge_id: Option<String>,
-    pub reused_script: bool,
     /// None while AwaitingApproval has a durable operation awaiting idempotent association.
     pub approval_id: Option<String>,
     pub operation: Option<approval::ProposedOperation>,
     pub observation: Option<TargetObservation>,
-    pub receipt: Option<ScriptReceipt>,
+    pub receipt: Option<RepairReceipt>,
     pub verification: Option<BusinessVerification>,
     /// Independent execution facts and caller attribution, never inferred from health.
     #[serde(default)]
@@ -253,7 +210,6 @@ pub struct RecoveryTask {
     pub note: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    pub diagnosis_call: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

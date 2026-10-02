@@ -1,61 +1,44 @@
-# Host 接入迁移：0.1 到 0.2
+# Host 接入
 
-`recuvora-core` 0.2 是破坏性的 Host API 变更。当前包只提供纯领域状态计算、提案和验证；持久保存、外部调用、调度、取消等待与目标所有权由可信 Host 实现。旧适配实现保留为项目外开发参考，不作为当前 Cargo 包编译内容，也不构成已经完成的 Host 集成。
+`recuvora-core` 提供纯领域计算、提案和验证。可信 Host 负责持久保存、外部能力调用、调度、取消等待和目标所有权。本库只支持当前接口和当前历史协议；恢复配置使用 schema 2，不提供旧协议适配或旧历史导入。包版本不替代领域配置版本。
 
-## 接口替换
+## 接口与职责
 
-| 0.1 接入方式 | 0.2 接入方式 |
+| 入口 | Host 对接职责 |
 | --- | --- |
-| `IncidentStore` 打开并写入本地日志 | `IncidentLedger` 计算观察或关注提案，Host 原子保存和确认 |
-| `ApprovalStore` 同步审批日志后交付许可 | `ApprovalLedger` 返回审批提案，Host 确认后接收许可 |
-| `KnowledgeStore` 保存候选、案例和检查点 | `KnowledgeState` 返回命令提案、查询和完整数据输出，Host 保存命令历史 |
-| `RecoveryService` 编排存储和外部端口 | `RecoveryState` 计算事件迁移及确认后的 `RecoveryEffect` |
-| `RepairBackend`、`KnowledgeSource` 异步端口 | Host 调用能力模块，把结果作为领域输入交回 Core |
-| `IncidentGuard`、`TargetOwnership` 和文件所有权实现 | Host 保证当前故障版本与排他目标归属，提供 `IncidentEvidence`、`TargetAuthority` |
-| `Cancellation`、`CallScope` 和服务关闭 | Host 管理计时、取消、在途调用、停止证据与关闭顺序 |
-| Core 的文件日志、文件锁、物理压缩和日志迁移 | Host 存储适配及维护流程；Core 仅验证领域历史和不变量 |
+| `IncidentLedger` | 提供观察及当前时间，原子保存完整观察事务和故障历史 |
+| `ApprovalLedger` | 保存完整操作与政策、调用审核、提交消费并接收一次许可 |
+| `RecoveryState` | 提供故障、观察、目标所有权和执行事实，确认后处理修复、验收与总结效果 |
+| `KnowledgeState` | 保存可信修复经验与命令历史，提供精确查询和不可变版本事实 |
+| `CommitRequest`、`CommitReceipt` | 在正确聚合上比较版本并可靠持久提交，再确认完全相同的请求 |
 
-公开顶层仍只有 `operation` 与 `recovery`，本库不新增应用入口、工作区子包或存储服务。完整源码与 API 导航见[模块入口](module-map.md)。
+公开顶层只有 `operation` 与 `recovery`，本库没有应用入口、运行时或存储服务。完整模块及领域 API 见[源码导航](../src/README.md)。
 
 ## Host 接入步骤
 
-1. 建立各领域聚合的稳定存储身份、原始可信配置及完整已提交历史。初始状态由各域构造器创建，已有状态通过所属恢复入口重建。
-2. 实现提案提交：保存完整事件或命令、提交请求及记录版本，原子比较旧版本，拒绝重复身份的内容冲突。只有可靠成功才构造 `CommitReceipt`；超时、断连或队列接收均不能代替确认。
-3. 实现确认后副作用处理，把诊断、审核、实际执行和验收结果作为新输入返回。时间由 Host 显式提供，重试和取消必须保留原调用身份与停止证据。
-4. 按[领域维护](domain-maintenance.md#跨域提交顺序)对接审批关联、两次执行授权提交、结果核实与经验交付。为同一目标实现跨聚合、跨实例的所有权，并保护当前故障版本复核边界。
-5. 对提交冲突、未知提交结果、各提交边界的进程中断、迟到回调、存储不可用和经验重复交付进行 Host 集成验收。Core 的内存测试不替代这些验证。
-
-查询快照可以传给存储或查询模块，但不是恢复所有权威状态的通用安装接口。尤其是知识快照不能直接变成成功验收或清除历史隔离；详细接口见[知识库说明](../src/recovery/knowledge/README.md)。
+1. 建立各领域聚合的稳定存储身份、原始可信配置和完整已提交历史。初始状态由构造器创建，当前协议的历史经所属恢复入口重建；数据快照不能直接安装为权威状态。
+2. 保存完整事件或命令、提交请求和记录版本，原子比较旧版本，拒绝重复提交身份的内容冲突。可靠成功后才构造 `CommitReceipt`；超时、断连或队列接收不能代替确认。
+3. 使用 `StartRepair` 创建统一 Harness 请求；审批显式委托 `repair_with_harness`，目标配置的 `allowed_action_kinds` 限定会话内具体动作范围。有经验和无经验采用相同接入流程。
+4. 按[跨域提交顺序](domain-maintenance.md#跨域提交顺序)对接审批关联、许可消费、流程授权、动作保存、执行结果和业务验收。同一目标的跨聚合、跨实例所有权必须覆盖当前故障复核与实际派发。
+5. 实现独立只读总结调用，保存 `ExperienceReport`，由受保护结果构造可信经验并提交知识域，最后确认流程经验交付。失败只重试未完成部分，不重跑修复。
+6. 针对提交冲突、未知提交结果、各提交边界进程中断、迟到回调、存储不可用和幂等经验交付进行 Host 集成验收。Core 内存测试不替代这些验证。
 
 ## 当前增量提交接口
 
-当前提交请求采用先前历史摘要与完整新输入，故障和审批历史增加必需的 `prior_digest`。这与此前保存完整前状态的 0.2 开发请求不兼容，不能混合使用或用旧回执确认新提案。Host 应把请求作为不透明的内容绑定，保存 Core 生成的完整条目；增量落库用 `latest_entry()`，完整导出用现返回 `Vec<Entry>` 的 `entries()`。具体契约见[领域维护](domain-maintenance.md#增量绑定与历史导出)。
+提交请求绑定先前历史摘要和完整新输入；故障与审批条目携带 `prior_digest`。Host 把请求作为完整内容绑定保存，用 `latest_entry()` 增量落库，用 `entries()` 导出完整历史。记录版本、领域、身份或输入不一致的回执不能确认提案。具体契约见[增量绑定与历史导出](domain-maintenance.md#增量绑定与历史导出)。
 
-所有 Harness 回调切换为 `BeginReview` 提交确认后取得尝试，再提交 `AssessAttempt`。普通 `Assess` 在实时和普通历史迁移中均拒绝。完整旧审批历史只能通过 `ApprovalImport::validate` 与 `ApprovalLedger::prepare_import` 验证后导入；此入口按原政策、审核身份及期限验证历史 `Assess`，保留原 revision，不补造 `BeginReview` 或许可。
+Harness 审核须先提交 `BeginReview`，确认后取得尝试，再提交 `AssessAttempt`；迟到或没有已提交尝试的回调被拒绝。恢复与审核规则见[审批](approval.md)。知识容量通过 `ExpandCapacity` 单调扩展，保存原配置和完整命令链，不直接替换初始配置，见[知识接口](../src/recovery/knowledge/README.md#逻辑容量)。
 
-知识扩容使用 `ExpandCapacity` 命令，保存原配置以及扩容前后的完整命令链，不能直接替换初始配置。重复或未知提交的处理见[知识接口](../src/recovery/knowledge/README.md#逻辑容量与查询摘要)。
+## 能力与证据适配
 
-## 旧数据导入边界
+`RepairArtifact` 的 `kind`、JSON `payload`、前提、版本和生成来源作为完整不可变内容保存。Core 不解释具体语言、平台或提供方格式；Host 检查实际执行器支持、当前前提及能力限制，并提交 `RepairActionPrepared` 后才发送动作。生成来源绑定原操作，执行回执 `RepairReceipt.execution_trace` 精确回传已提交内容。
 
-Core 提供完整旧审批和恢复流程历史的纯导入接口，不读取旧 JSONL 或切换文件。Host 负责冻结来源、物理格式与完整性检查、原配置映射、知识命令重放及原子安装。Core 不接受单个任务终态快照替代完整历史。
+`RepairExecutionOutcome` 只表达执行结果。独立 `BusinessVerification` 表达业务验收；Unknown 核实还需 `ExecutionResultCheck`，不能用当前业务健康补造执行事实。超时、停止、在途调用等待和关闭属于 Host，取消或断连本身不是停止证据。
 
-导入必须保留故障轮次、完整原操作、审批和审核归属、一次消费事实、脚本版本、案例幂等键、失败隔离、Unknown 及独立结果核实证据。不能把已有执行意图转换成待执行的新动作，不能用健康状态填补缺失执行证据，也不能静默删除无法解释的记录。
+`ExperienceJob.record()` 将实际动作放入 `RepairExperience.actions`；总结候选来源绑定总结调用，不能被解释为已经验证的可执行权限。只有可信 Host 可从受保护结果构造 `TrustedRepairExperience`；模型输出、查询快照和外部响应不能直接恢复权威领域状态。
 
-Host 应在原存储冻结、在途状态已经核实的前提下转换数据，再通过 0.2 的领域迁移校验和专门导入测试验证。无法表达或证据不足的历史应阻塞切换并保留原数据，由可信维护流程处置。维护条件见[领域维护](domain-maintenance.md#数据维护)，当前实现与验证范围见[实现状态](implementation-status.md)。
+## 当前历史与维护
 
+重启使用当前协议的原配置和完整历史，按各域相同校验重建；随后提交审批恢复和流程 `Recover`，保留原操作、原期限、已消费许可、总结尝试和永久隔离。历史恢复不返回可重新派发的执行效果。
 
-### 领域导入顺序
-
-1. Host 用 `ApprovalImport::validate` 校验完整 `LegacyApprovalEntry` 序列，经空审批聚合的 `prepare_import` 提案、可靠保存和确认，保留旧审核、原操作与消费事实。确认不产生审核或执行效果。
-2. Host 将完整工作流记录映射为 `LegacyRecoveryRevision`，用原 `RecoveryConfig`、上一步审批聚合和已验证知识聚合调用 `RecoveryImport::validate`。格式 1 的缺失轮次从全部不同故障身份推导；格式 2 必须携带正确轮次。缺行、倒退、原操作或脚本变化、缺失审批、跨域结果和案例身份冲突均拒绝。
-3. 若 `execution_uncertainties()` 返回证明，先用 `ApprovalLedger::prepare_legacy_uncertain` 保存封锁，再以更新后的审批重新验证工作流。旧 Executing/Unknown 与仍为 Approved 的审批可能处于消费结果不明窗口；封锁保留原操作与 revision，将审批置 Unknown，不虚构 Consume、不产生许可。未封锁时拒绝安装工作流。
-4. 在空 `RecoveryState` 上 `prepare_import`，保存完整 `LegacyImported` 条目并确认。事件携带完整原历史及受保护的跨域校验证据；普通 `Event` 不接受它作为实时命令。`restore` 再次执行相同校验。导入无外部效果，激活新工作前仍须显式提交各域 Recover。
-5. 未消费待审批保持原操作并进入 Paused，需显式 Resume；执行意图及未知结果保持 Unknown 和脚本隔离，不能自动重发。Publishing 保留原候选、案例 ID 和时间，并按已有证据归类为 Completed、Failed 或 Unknown；即使复用脚本失败后尚有诊断预算，也不在导入时自动续诊断。知识已经提交完全相同案例时不再交付，否则保留有序待交付。导入后的独立核实仍使用原案例身份，历史 Unknown 隔离永久保留。
-
-导入要求全批验证与全批安装，不允许先激活一个领域再补齐其余领域。Host 文件导入、进程中断及所有权切换验证由 Host 项目维护；本库测试只证明上述纯领域规则。
-
-## 统一 Harness 修复接入
-
-新委托显式允许 `repair_with_harness` 后，使用 `RecoveryCommand::StartRepair`；请求无需预先生成脚本。原 `SelectPlan`/`DiagnosisCompleted` 仍用于已有脚本任务。不能直接修改持久聚合绑定的原配置再重放；配置切换须在旧任务和在途执行均已核实后由可信 Host 维护，不能丢弃旧隔离或更换目录绕过所有权。
-
-Host 后端增加独立只读 `summarize`，保存 `RepairActionPrepared` 后才发送具体动作，并在回执中保留 `execution_trace`。空 trace 不序列化，保留旧历史的内容绑定。经验命令存储增加 `RecordExperience`，仅在受保护日志恢复时重建 `TrustedRepairExperience`。新事件和命令不能交给旧二进制解释；升级前保留完整历史，升级后不能直接回退旧写者。
+物理日志格式、备份、原子安装、目录保护与配置切换均属于 Host。配置或协议不匹配应拒绝恢复，不能删除安全事实、改编号或编造提交来绕过校验。Core 没有通用历史裁剪、快照安装或协议转换入口。维护义务见[领域维护](domain-maintenance.md#数据维护)，当前验证范围见[实现状态](implementation-status.md)。

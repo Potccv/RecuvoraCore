@@ -2,61 +2,47 @@ use recuvora_core::operation::{CommitReceipt, CommitRequest};
 use recuvora_core::recovery::knowledge::*;
 use std::collections::BTreeMap;
 
-fn candidate(id: &str, version: u64) -> KnowledgeCandidate {
-    KnowledgeCandidate {
+fn artifact(id: &str, version: u64) -> RepairArtifact {
+    RepairArtifact {
         id: id.into(),
-        incident_id: "incident-a".into(),
-        summary: "target condition differs".into(),
-        keywords: vec!["condition".into(), "workload".into()],
-        conditions: BTreeMap::from([("condition".into(), "unready".into())]),
-        script: ScriptArtifact {
-            id: "repair-script".into(),
-            version,
-            language: "python".into(),
-            platform: "portable".into(),
-            source: "print('external action proposal')\n".into(),
-            preconditions: BTreeMap::from([("workload_version".into(), "1".into())]),
-            generated_by_harness: "harness-execution".into(),
-            generated_in_session: "session-a".into(),
-        },
-        reusable: false,
-        evidence_refs: vec!["observation:1".into()],
-        created_at_ms: 100,
+        version,
+        kind: "provider-action".into(),
+        payload: serde_json::json!({"action": "restore", "parameters": [1, true, null]}),
+        preconditions: BTreeMap::from([("workload_version".into(), "1".into())]),
+        generated_by_harness: "harness-a".into(),
+        generated_in_session: "session-a".into(),
     }
 }
 
-fn case(id: &str, outcome: RepairOutcome, version: u64) -> RepairCase {
-    RepairCase {
+fn experience(id: &str, outcome: RepairOutcome) -> RepairExperience {
+    RepairExperience {
         id: id.into(),
         operation_id: format!("operation-{id}"),
         target_id: "target-a".into(),
-        script_id: "repair-script".into(),
-        script_version: version,
+        conditions: BTreeMap::from([("condition".into(), "unready".into())]),
+        keywords: vec!["condition".into(), "workload".into()],
         outcome,
-        evidence_refs: vec![format!("operation:{id}")],
-        recorded_at_ms: 300,
+        evidence_refs: vec![format!("evidence:{id}")],
+        recorded_at_ms: 100,
+        actions: vec![],
+        report: ExperienceReport {
+            summary: "Target condition inspected".into(),
+            lessons: "Check current target facts before selecting an action".into(),
+            related_experience_ids: vec![],
+            scriptability: Scriptability::Undetermined {
+                reason: "More observations needed".into(),
+            },
+        },
     }
 }
 
-fn proof(case: &RepairCase) -> TrustedBusinessVerification {
-    TrustedBusinessVerification::attest(
-        &case.operation_id,
-        &case.target_id,
-        &case.script_id,
-        case.script_version,
-        "trusted-target-verifier",
-        vec![format!("verification:{}", case.id)],
-        200,
-    )
-    .unwrap()
+fn command(item: RepairExperience) -> KnowledgeCommand {
+    KnowledgeCommand::RecordExperience(TrustedRepairExperience::attest(item).unwrap())
 }
 
 fn query() -> KnowledgeQuery {
     KnowledgeQuery {
-        conditions: BTreeMap::from([
-            ("condition".into(), "unready".into()),
-            ("workload_version".into(), "1".into()),
-        ]),
+        conditions: BTreeMap::from([("condition".into(), "unready".into())]),
         keywords: vec!["condition".into()],
         limit: 10,
     }
@@ -71,597 +57,242 @@ fn commit(state: KnowledgeState, command: KnowledgeCommand) -> KnowledgeState {
         .propose(format!("commit-{}", state.revision()), command)
         .unwrap();
     let receipt = CommitReceipt::confirmed(pending.request());
-    pending.confirm(receipt).unwrap().state
+    let confirmed = pending.confirm(receipt).unwrap();
+    assert!(confirmed.effects.is_empty());
+    confirmed.state
 }
 
-fn verified(record: &str, id: &str, version: u64) -> KnowledgeCommand {
-    let case = case(id, RepairOutcome::Verified, version);
-    let verification = Some(proof(&case));
-    KnowledgeCommand::RecordOutcome {
-        record_id: record.into(),
-        case,
-        verification,
-    }
+fn replay(
+    config: KnowledgeConfig,
+    history: &[(CommitRequest, KnowledgeCommand)],
+) -> Result<KnowledgeState, KnowledgeError> {
+    KnowledgeState::replay(
+        config,
+        history
+            .iter()
+            .map(|(request, command)| KnowledgeReplayEntry {
+                request: request.clone(),
+                command: command.clone(),
+                receipt: CommitReceipt::confirmed(request),
+            })
+            .collect(),
+    )
 }
 
 #[test]
-fn proposals_preserve_original_state_and_require_matching_confirmation() {
+fn proposals_preserve_original_state_and_require_exact_confirmation() {
     let state = initial();
-    let pending = state
-        .propose(
-            "candidate",
-            KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
-        )
-        .unwrap();
+    let item = experience("a", RepairOutcome::Verified);
+    let pending = state.propose("experience", command(item.clone())).unwrap();
     assert!(state.get("a").is_none());
     assert_eq!(state.revision(), 0);
-    let wrong = CommitRequest {
-        id: "different".into(),
-        expected_revision: 0,
-        revision: 1,
-        domain: "knowledge".into(),
-        input: serde_json::Value::Null,
-    };
+    let mut wrong = pending.request().clone();
+    wrong.input = serde_json::Value::Null;
     assert!(pending.confirm(CommitReceipt::confirmed(&wrong)).is_err());
-    let state = commit(state, KnowledgeCommand::UpsertCandidate(candidate("a", 1)));
-    assert_eq!(state.get("a").unwrap().status, KnowledgeStatus::Candidate);
-    assert!(state.search(&query()).unwrap().is_empty());
+    let state = commit(state, command(item.clone()));
+    assert_eq!(state.get("a"), Some(item));
+    assert_eq!(state.search_experiences(&query()).unwrap().len(), 1);
 }
 
 #[test]
-fn verified_requires_bound_trusted_evidence() {
-    let state = commit(
-        initial(),
-        KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
-    );
-    let result = case("case-a", RepairOutcome::Verified, 1);
-    assert!(
-        state
-            .propose(
-                "no-proof",
-                KnowledgeCommand::RecordOutcome {
-                    record_id: "a".into(),
-                    case: result.clone(),
-                    verification: None,
-                }
-            )
-            .is_err()
-    );
-    let mut wrong = result.clone();
-    wrong.target_id = "other-target".into();
-    assert!(
-        state
-            .propose(
-                "wrong-proof",
-                KnowledgeCommand::RecordOutcome {
-                    record_id: "a".into(),
-                    case: result,
-                    verification: Some(proof(&wrong)),
-                }
-            )
-            .is_err()
-    );
-    let state = commit(state, verified("a", "case-a", 1));
-    assert_eq!(state.search(&query()).unwrap().len(), 1);
-    assert!(state.search_reusable(&query()).unwrap().is_empty());
-}
-
-#[test]
-fn immutable_versions_and_global_case_idempotency_are_retained() {
-    let original = candidate("a", 1);
-    let state = commit(
-        initial(),
-        KnowledgeCommand::UpsertCandidate(original.clone()),
-    );
-    let state = commit(state, verified("a", "case-a", 1));
-    let before = state.get("a").unwrap();
-    let state = commit(state, verified("a", "case-a", 1));
-    assert_eq!(state.get("a").unwrap(), before);
-    let state = commit(state, KnowledgeCommand::UpsertCandidate(original));
-    assert_eq!(state.get("a").unwrap(), before);
-    let mut conflicting = candidate("b", 1);
-    conflicting.script.source = "changed content".into();
-    assert!(
-        state
-            .propose(
-                "changed-script",
-                KnowledgeCommand::UpsertCandidate(conflicting)
-            )
-            .is_err()
-    );
-    let state = commit(state, KnowledgeCommand::UpsertCandidate(candidate("b", 1)));
-    assert!(
-        state
-            .propose("case-reuse", verified("b", "case-a", 1))
-            .is_err()
-    );
-}
-
-#[test]
-fn failure_unknown_and_disablement_permanently_quarantine_all_same_version_cases() {
-    for outcome in [RepairOutcome::Failed, RepairOutcome::Unknown] {
-        let state = commit(
-            initial(),
-            KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
-        );
-        let state = commit(state, KnowledgeCommand::UpsertCandidate(candidate("b", 1)));
-        let state = commit(state, verified("b", "success-b", 1));
-        let state = commit(
-            state,
-            KnowledgeCommand::RecordOutcome {
-                record_id: "a".into(),
-                case: case("failure", outcome, 1),
-                verification: None,
-            },
-        );
-        let state = commit(state, verified("a", "later-success", 1));
-        assert_eq!(state.get("a").unwrap().status, KnowledgeStatus::Verified);
-        assert!(state.is_quarantined("repair-script", 1));
-        assert!(state.search(&query()).unwrap().is_empty());
-        let state = commit(state, KnowledgeCommand::UpsertCandidate(candidate("c", 2)));
-        let state = commit(state, verified("c", "new-version-success", 2));
-        assert_eq!(state.search(&query()).unwrap()[0].id, "c");
+fn artifact_validation_is_neutral_bounded_and_strictly_shaped() {
+    let mut item = artifact("action", 1);
+    for kind in ["script", "configuration-change", "future-provider-format"] {
+        item.kind = kind.into();
+        item.validate().unwrap();
     }
-    let state = commit(
-        initial(),
-        KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
-    );
-    let state = commit(
-        state,
-        KnowledgeCommand::Disable {
-            record_id: "a".into(),
-            expected_revision: 1,
-            actor: "maintainer".into(),
-            reason: "excluded".into(),
-        },
-    );
-    assert!(state.is_quarantined("repair-script", 1));
+    item.payload = serde_json::Value::String("x".repeat(MAX_ARTIFACT_BYTES - 2));
+    item.validate().unwrap();
+    item.payload = serde_json::Value::String("x".repeat(MAX_ARTIFACT_BYTES - 1));
+    assert!(item.validate().is_err());
+    item = artifact("action", 0);
+    assert!(item.validate().is_err());
+    item.version = 1;
+    item.generated_in_session.clear();
+    assert!(item.validate().is_err());
+    item = artifact("action", 1);
+    item.preconditions.clear();
+    assert!(item.validate().is_err());
+    let mut raw = serde_json::to_value(artifact("action", 1)).unwrap();
+    raw["language"] = "python".into();
+    assert!(serde_json::from_value::<RepairArtifact>(raw).is_err());
     assert!(
-        state
-            .propose("post-disable", verified("a", "later", 1))
-            .is_err()
-    );
-}
-
-#[test]
-fn replay_repeats_validation_and_preserves_quarantine_even_after_later_success() {
-    let commands = vec![
-        KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
-        KnowledgeCommand::RecordOutcome {
-            record_id: "a".into(),
-            case: case("unknown", RepairOutcome::Unknown, 1),
-            verification: None,
-        },
-        verified("a", "later-success", 1),
-    ];
-    let mut state = initial();
-    let mut history = Vec::new();
-    for (index, command) in commands.into_iter().enumerate() {
-        let pending = state
-            .propose(format!("commit-{index}"), command.clone())
-            .unwrap();
-        let request = pending.request().clone();
-        state = pending
-            .confirm(CommitReceipt::confirmed(&request))
-            .unwrap()
-            .state;
-        history.push(KnowledgeReplayEntry {
-            receipt: CommitReceipt::confirmed(&request),
-            request,
-            command,
-        });
-    }
-    let replayed = KnowledgeState::replay(KnowledgeConfig::default(), history).unwrap();
-    assert_eq!(replayed.get("a"), state.get("a"));
-    assert!(replayed.is_quarantined("repair-script", 1));
-    assert!(replayed.search(&query()).unwrap().is_empty());
-    let request = CommitRequest {
-        id: "gap".into(),
-        expected_revision: 1,
-        revision: 2,
-        domain: "knowledge".into(),
-        input: serde_json::Value::Null,
-    };
-    assert!(
-        KnowledgeState::replay(
-            KnowledgeConfig::default(),
-            vec![KnowledgeReplayEntry {
-                receipt: CommitReceipt::confirmed(&request),
-                request,
-                command: KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
-            }]
-        )
-        .is_err()
-    );
-    let request = CommitRequest {
-        id: "bad-evidence".into(),
-        expected_revision: 0,
-        revision: 1,
-        domain: "knowledge".into(),
-        input: serde_json::Value::Null,
-    };
-    assert!(
-        KnowledgeState::replay(
-            KnowledgeConfig::default(),
-            vec![KnowledgeReplayEntry {
-                receipt: CommitReceipt::confirmed(&request),
-                request,
-                command: verified("missing", "case-a", 1),
-            }]
+        serde_json::from_value::<KnowledgeConfig>(
+            serde_json::json!({"max_records": 1, "max_cases_per_record": 1})
         )
         .is_err()
     );
 }
 
 #[test]
-fn exact_matching_and_reuse_filter_precede_limit_and_ranking_is_stable() {
-    let mut reusable = candidate("b", 2);
-    reusable.reusable = true;
-    let state = commit(
-        initial(),
-        KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
-    );
-    let state = commit(state, KnowledgeCommand::UpsertCandidate(reusable));
-    let state = commit(state, verified("a", "success-a", 1));
-    let state = commit(state, verified("a", "success-a2", 1));
-    let state = commit(state, verified("b", "success-b", 2));
-    let mut limited = query();
-    limited.limit = 1;
-    assert_eq!(state.search(&limited).unwrap()[0].id, "a");
-    assert_eq!(state.search_reusable(&limited).unwrap()[0].id, "b");
-    limited
-        .conditions
-        .insert("workload_version".into(), "2".into());
-    assert!(state.search(&limited).unwrap().is_empty());
-    let mut different_case = query();
-    different_case.keywords = vec!["Condition".into()];
-    assert!(state.search(&different_case).unwrap().is_empty());
-}
-
-#[test]
-fn external_candidates_are_read_only_bound_and_never_reusable() {
-    let state = initial();
-    let mut proposed = candidate("external", 1);
-    proposed.reusable = true;
-    let proposal = KnowledgeProposal {
-        source_id: "source-a".into(),
-        candidate: proposed,
-        evidence_refs: vec!["external-evidence".into()],
+fn attestation_rejects_unbounded_actions_invalid_evidence_and_reports() {
+    let item = experience("a", RepairOutcome::Verified);
+    let mut invalid = item.clone();
+    invalid.actions = vec![artifact("a", 1), artifact("b", 1)];
+    assert!(TrustedRepairExperience::attest(invalid).is_err());
+    let mut invalid = item.clone();
+    invalid.evidence_refs.clear();
+    assert!(TrustedRepairExperience::attest(invalid).is_err());
+    let mut invalid = item.clone();
+    invalid.operation_id.clear();
+    assert!(TrustedRepairExperience::attest(invalid).is_err());
+    let mut invalid = item.clone();
+    invalid.report.related_experience_ids = vec!["a".into(), "a".into()];
+    assert!(TrustedRepairExperience::attest(invalid).is_err());
+    let mut invalid = item.clone();
+    invalid.actions = vec![artifact("a", 0)];
+    assert!(TrustedRepairExperience::attest(invalid).is_err());
+    let mut invalid = item;
+    invalid.report.scriptability = Scriptability::Possible {
+        reason: "candidate".into(),
+        candidate: Some(artifact("a", 0)),
     };
-    let accepted = state
-        .validate_external_candidates("source-a", &query(), vec![proposal.clone()])
-        .unwrap();
-    assert!(!accepted[0].reusable);
-    assert!(state.get("external").is_none());
-    assert!(
-        state
-            .validate_external_candidates("source-b", &query(), vec![proposal.clone()])
-            .is_err()
-    );
-    assert!(
-        state
-            .validate_external_candidates("source-a", &query(), vec![proposal.clone(), proposal])
-            .is_err()
-    );
-    let state = commit(
-        state,
-        KnowledgeCommand::UpsertCandidate(candidate("local", 1)),
-    );
-    let state = commit(
-        state,
-        KnowledgeCommand::RecordOutcome {
-            record_id: "local".into(),
-            case: case("failure", RepairOutcome::Failed, 1),
-            verification: None,
-        },
-    );
-    let proposal = KnowledgeProposal {
-        source_id: "source-a".into(),
-        candidate: candidate("external", 1),
-        evidence_refs: vec!["external-evidence".into()],
-    };
-    assert!(
-        state
-            .validate_external_candidates("source-a", &query(), vec![proposal])
-            .unwrap()
-            .is_empty()
-    );
+    assert!(TrustedRepairExperience::attest(invalid).is_err());
 }
 
 #[test]
-fn logical_capacity_rejects_before_commit_and_does_not_drop_history() {
-    let state = KnowledgeState::new(KnowledgeConfig {
-        max_records: 1,
-        max_cases_per_record: 1,
-    })
-    .unwrap();
-    let state = commit(state, KnowledgeCommand::UpsertCandidate(candidate("a", 1)));
-    assert!(matches!(
-        state.propose(
-            "exhausted",
-            KnowledgeCommand::UpsertCandidate(candidate("b", 2))
-        ),
-        Err(KnowledgeError::Capacity(_))
-    ));
-    let state = commit(state, verified("a", "case-a", 1));
-    assert!(matches!(
-        state.propose("case-exhausted", verified("a", "case-b", 1)),
-        Err(KnowledgeError::Capacity(_))
-    ));
-    assert_eq!(state.get("a").unwrap().cases.len(), 1);
-    assert_eq!(state.projection().cases, 1);
-}
-
-#[test]
-fn external_response_allocation_and_content_are_bounded() {
-    let state = initial();
-    let mut large = candidate("large", 1);
-    large.script.source = "x".repeat(MAX_SCRIPT_BYTES);
-    large.conditions = (0..32)
-        .map(|index| (format!("condition-{index}"), "v".repeat(1024)))
-        .collect();
-    large.script.preconditions = large.conditions.clone();
-    let proposals = (0..100)
-        .map(|index| {
-            let mut candidate = large.clone();
-            candidate.id = format!("external-{index}");
-            KnowledgeProposal {
-                source_id: "source-a".into(),
-                candidate,
-                evidence_refs: vec!["external".into()],
-            }
-        })
-        .collect();
-    let mut query = query();
-    query.limit = 100;
-    assert!(matches!(
-        state.validate_external_candidates("source-a", &query, proposals),
-        Err(KnowledgeError::Capacity(_))
-    ));
-    large.script.source.push('x');
-    assert!(matches!(
-        state.validate_external_candidates(
-            "source-a",
-            &query,
-            vec![KnowledgeProposal {
-                source_id: "source-a".into(),
-                candidate: large,
-                evidence_refs: vec!["external".into()],
-            }]
-        ),
-        Err(KnowledgeError::Invalid(_))
-    ));
-}
-
-#[test]
-fn replay_rejects_unverified_success_and_preserves_idempotency_keys() {
-    let first = initial()
-        .propose(
-            "candidate",
-            KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
-        )
-        .unwrap()
-        .request()
-        .clone();
-    let second = CommitRequest {
-        id: "invalid-success".into(),
-        expected_revision: 1,
-        revision: 2,
-        domain: "knowledge".into(),
-        input: serde_json::Value::Null,
-    };
-    let entries = vec![
-        KnowledgeReplayEntry {
-            receipt: CommitReceipt::confirmed(&first),
-            request: first,
-            command: KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
-        },
-        KnowledgeReplayEntry {
-            receipt: CommitReceipt::confirmed(&second),
-            request: second,
-            command: KnowledgeCommand::RecordOutcome {
-                record_id: "a".into(),
-                case: case("case-a", RepairOutcome::Verified, 1),
-                verification: None,
-            },
-        },
-    ];
-    assert!(matches!(
-        KnowledgeState::replay(KnowledgeConfig::default(), entries),
-        Err(KnowledgeError::Invalid(_))
-    ));
-    let commands = vec![
-        KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
-        verified("a", "case-a", 1),
-        verified("a", "case-a", 1),
-    ];
-    let mut original = KnowledgeState::new(KnowledgeConfig {
-        max_records: 1,
-        max_cases_per_record: 1,
-    })
-    .unwrap();
-    let entries = commands
-        .into_iter()
-        .enumerate()
-        .map(|(index, command)| {
-            let pending = original
-                .propose(format!("commit-{index}"), command.clone())
-                .unwrap();
-            let request = pending.request().clone();
-            original = pending
-                .confirm(CommitReceipt::confirmed(&request))
-                .unwrap()
-                .state;
-            KnowledgeReplayEntry {
-                receipt: CommitReceipt::confirmed(&request),
-                request,
-                command,
-            }
-        })
-        .collect();
-    let state = KnowledgeState::replay(
-        KnowledgeConfig {
-            max_records: 1,
-            max_cases_per_record: 1,
-        },
-        entries,
-    )
-    .unwrap();
-    assert_eq!(state.get("a").unwrap().cases.len(), 1);
-    assert_eq!(state.get("a").unwrap().revision, 2);
-    assert_eq!(state.revision(), 3);
-    let mut changed_case = case("case-a", RepairOutcome::Unknown, 1);
-    changed_case.evidence_refs = vec!["changed".into()];
-    assert!(matches!(
-        state.propose(
-            "conflicting-retry",
-            KnowledgeCommand::RecordOutcome {
-                record_id: "a".into(),
-                case: changed_case,
-                verification: None,
-            }
-        ),
-        Err(KnowledgeError::Conflict(_))
-    ));
-}
-
-#[test]
-fn host_transport_export_preserves_failure_history_after_success() {
-    let state = commit(
-        initial(),
-        KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
-    );
-    let state = commit(
-        state,
-        KnowledgeCommand::RecordOutcome {
-            record_id: "a".into(),
-            case: case("unknown", RepairOutcome::Unknown, 1),
-            verification: None,
-        },
-    );
-    let command = verified("a", "later", 1);
-    let encoded = serde_json::to_value(&command).unwrap();
-    assert!(encoded["RecordOutcome"]["verification"]["verifier_id"].is_string());
-    let state = commit(state, command);
-    let snapshot = serde_json::to_value(state.snapshot()).unwrap();
-    assert_eq!(snapshot["records"][0]["cases"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        snapshot["records"][0]["cases"][0]["result"]["outcome"],
-        "unknown"
-    );
-    assert_eq!(snapshot["records"][0]["status"], "verified");
-    assert!(state.is_quarantined("repair-script", 1));
-}
-
-#[test]
-fn external_candidate_normalization_is_repeatable_but_conflicts_remain_atomic() {
-    let mut raw = candidate("external", 1);
-    raw.reusable = true;
-    raw.evidence_refs.push("observation:2".into());
-    let proposal = KnowledgeProposal {
-        source_id: "source".into(),
-        candidate: raw,
-        evidence_refs: vec!["proposal:2".into(), "proposal:1".into()],
-    };
-    let normalized = initial()
-        .validate_external_candidates("source", &query(), vec![proposal.clone()])
-        .unwrap()
-        .remove(0);
-    assert!(!normalized.reusable);
-    let state = commit(
-        initial(),
-        KnowledgeCommand::UpsertCandidate(normalized.clone()),
-    );
-    assert_eq!(
-        state
-            .validate_external_candidates("source", &query(), vec![proposal.clone()])
-            .unwrap(),
-        vec![normalized.clone()]
-    );
-    let mut reordered = proposal.clone();
-    reordered.candidate.evidence_refs.reverse();
-    reordered.evidence_refs.reverse();
-    reordered
-        .candidate
-        .evidence_refs
-        .push("knowledge-source:source".into());
-    assert_eq!(
-        state
-            .validate_external_candidates("source", &query(), vec![reordered])
-            .unwrap(),
-        vec![normalized]
-    );
+fn experiences_are_exactly_idempotent_and_conflicting_content_is_rejected() {
+    let item = experience("a", RepairOutcome::Verified);
+    let state = commit(initial(), command(item.clone()));
+    let state = commit(state, command(item.clone()));
+    assert_eq!(state.projection().experiences, 1);
+    assert_eq!(state.revision(), 2);
     for field in 0..3 {
-        let mut changed = proposal.clone();
+        let mut changed = item.clone();
         match field {
-            0 => changed.candidate.script.source.push_str("changed"),
-            1 => changed.candidate.summary.push_str("changed"),
-            _ => changed.source_id = "other".into(),
+            0 => changed.outcome = RepairOutcome::Unknown,
+            1 => changed.actions.push(artifact("action", 1)),
+            _ => changed.report.lessons.push_str(" changed"),
         }
-        let expected = changed.source_id.clone();
-        assert!(
-            state
-                .validate_external_candidates(&expected, &query(), vec![changed])
-                .is_err()
-        );
+        assert!(matches!(
+            state.propose("conflict", command(changed)),
+            Err(KnowledgeError::Conflict(_))
+        ));
     }
-    let mut conflict = proposal.clone();
-    conflict.candidate.id = "second".into();
-    conflict.candidate.script.source.push_str("changed");
-    assert!(
-        state
-            .validate_external_candidates("source", &query(), vec![proposal, conflict])
-            .is_err()
-    );
-    assert_eq!(state.projection().records, 1);
+    assert_eq!(state.get("a"), Some(item));
 }
 
 #[test]
-fn capacity_expansion_replays_and_preserves_all_isolation_and_identities() {
-    let original = KnowledgeConfig {
-        max_records: 2,
-        max_cases_per_record: 1,
+fn action_and_candidate_versions_share_one_immutable_registry() {
+    let original = artifact("action", 1);
+    let mut item = experience("a", RepairOutcome::Verified);
+    item.actions.push(original.clone());
+    let state = commit(initial(), command(item));
+    let mut changed = original.clone();
+    changed.payload = serde_json::json!({"changed": true});
+    assert!(state.validate_artifact(&changed).is_err());
+    let mut item = experience("b", RepairOutcome::Verified);
+    item.report.scriptability = Scriptability::Possible {
+        reason: "candidate".into(),
+        candidate: Some(changed.clone()),
     };
-    let target = KnowledgeConfig {
-        max_records: 3,
-        max_cases_per_record: 2,
-    };
-    let mut state = KnowledgeState::new(original.clone()).unwrap();
-    let mut history = Vec::new();
-    let commands = vec![
-        KnowledgeCommand::UpsertCandidate(candidate("a", 1)),
-        KnowledgeCommand::RecordOutcome {
-            record_id: "a".into(),
-            case: case("unknown", RepairOutcome::Unknown, 1),
-            verification: None,
-        },
-        KnowledgeCommand::UpsertCandidate(candidate("b", 2)),
-        KnowledgeCommand::RecordOutcome {
-            record_id: "b".into(),
-            case: case("failed", RepairOutcome::Failed, 2),
-            verification: None,
-        },
-        KnowledgeCommand::Disable {
-            record_id: "b".into(),
-            expected_revision: 2,
-            actor: "operator".into(),
-            reason: "disabled".into(),
-        },
-    ];
-    for (i, command) in commands.into_iter().enumerate() {
-        let pending = state
-            .propose(format!("commit-{i}"), command.clone())
-            .unwrap();
-        let request = pending.request().clone();
-        state = pending
-            .confirm(CommitReceipt::confirmed(&request))
-            .unwrap()
-            .state;
-        history.push((request, command));
+    assert!(state.propose("conflict", command(item.clone())).is_err());
+    item.actions.push(original);
+    assert!(
+        initial()
+            .propose("same-command-conflict", command(item))
+            .is_err()
+    );
+    assert_eq!(state.projection().artifacts, 1);
+    changed.version = 2;
+    state.validate_artifact(&changed).unwrap();
+    assert_eq!(state.projection().artifacts, 1);
+}
+
+#[test]
+fn failed_and_unknown_actions_are_permanently_quarantined_but_remain_references() {
+    for outcome in [RepairOutcome::Failed, RepairOutcome::Unknown] {
+        let mut item = experience("failure", outcome);
+        item.actions.push(artifact("executed", 1));
+        item.report.scriptability = Scriptability::Possible {
+            reason: "unexecuted proposal".into(),
+            candidate: Some(artifact("candidate", 1)),
+        };
+        let state = commit(initial(), command(item.clone()));
+        assert!(state.is_quarantined("executed", 1));
+        assert!(!state.is_quarantined("candidate", 1));
+        assert!(!state.is_quarantined("executed", 2));
+        assert_eq!(state.search_experiences(&query()).unwrap(), vec![item]);
+        let mut later = experience("later", RepairOutcome::Verified);
+        later.actions.push(artifact("executed", 1));
+        let state = commit(state, command(later));
+        assert!(state.is_quarantined("executed", 1));
+        assert_eq!(state.search_experiences(&query()).unwrap().len(), 2);
+        assert_eq!(state.projection().quarantined_versions, 1);
     }
-    let outcome = verified("a", "later", 1);
+}
+
+#[test]
+fn scriptless_experiences_and_candidates_do_not_create_execution_authority() {
+    let mut item = experience("a", RepairOutcome::Verified);
+    item.report.scriptability = Scriptability::Possible {
+        reason: "proposal".into(),
+        candidate: Some(artifact("candidate", 1)),
+    };
+    let state = commit(initial(), command(item));
+    assert!(state.get("a").unwrap().actions.is_empty());
+    assert_eq!(state.projection().artifacts, 1);
+    assert!(!state.is_quarantined("candidate", 1));
+    let mut item = experience("b", RepairOutcome::Failed);
+    item.report.scriptability = Scriptability::NotSuitable {
+        reason: "requires interactive investigation".into(),
+    };
+    let state = commit(state, command(item));
+    assert_eq!(state.search_experiences(&query()).unwrap().len(), 2);
+}
+
+#[test]
+fn exact_matching_precedes_limits_with_stable_time_and_identity_order() {
+    let mut state = initial();
+    for (id, time, condition) in [
+        ("z", 300, "other"),
+        ("b", 200, "unready"),
+        ("a", 200, "unready"),
+        ("c", 100, "unready"),
+    ] {
+        let mut item = experience(id, RepairOutcome::Unknown);
+        item.recorded_at_ms = time;
+        item.conditions.insert("condition".into(), condition.into());
+        state = commit(state, command(item));
+    }
+    let mut request = query();
+    request.limit = 2;
+    assert_eq!(
+        state
+            .search_experiences(&request)
+            .unwrap()
+            .iter()
+            .map(|v| v.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    request.keywords.push("missing".into());
+    assert!(state.search_experiences(&request).unwrap().is_empty());
+    request.keywords = vec!["Condition".into()];
+    assert!(state.search_experiences(&request).unwrap().is_empty());
+    request.limit = 0;
+    assert!(state.search_experiences(&request).is_err());
+}
+
+#[test]
+fn capacity_expansion_and_replay_preserve_experiences_and_isolation() {
+    let original = KnowledgeConfig { max_records: 1 };
+    let target = KnowledgeConfig { max_records: 2 };
+    let mut item = experience("a", RepairOutcome::Unknown);
+    item.actions.push(artifact("action", 1));
+    let first = command(item.clone());
+    let mut state = KnowledgeState::new(original.clone()).unwrap();
+    let pending = state.propose("first", first.clone()).unwrap();
+    let mut history = vec![(pending.request().clone(), first)];
+    state = pending
+        .confirm(CommitReceipt::confirmed(&history[0].0))
+        .unwrap()
+        .state;
+    let repeated = command(item);
+    assert!(state.propose("retry", repeated).is_ok());
+    let second = command(experience("b", RepairOutcome::Verified));
     assert!(matches!(
-        state.propose("full", outcome.clone()),
+        state.propose("full", second.clone()),
         Err(KnowledgeError::Capacity(_))
     ));
     let before = state.snapshot();
@@ -670,110 +301,99 @@ fn capacity_expansion_replays_and_preserves_all_isolation_and_identities() {
         target: target.clone(),
     };
     let pending = state.propose("expand", expansion.clone()).unwrap();
-    assert_eq!(state.snapshot(), before);
     let request = pending.request().clone();
-    // Interruption before confirmation leaves the old configuration replayable.
     drop(pending);
-    let replay = |items: &[(CommitRequest, KnowledgeCommand)], config: KnowledgeConfig| {
-        KnowledgeState::replay(
-            config,
-            items
-                .iter()
-                .map(|(request, command)| KnowledgeReplayEntry {
-                    request: request.clone(),
-                    command: command.clone(),
-                    receipt: CommitReceipt::confirmed(request),
-                })
-                .collect(),
-        )
-    };
+    assert_eq!(state.snapshot(), before);
     assert_eq!(
-        replay(&history, original.clone()).unwrap().snapshot(),
+        replay(original.clone(), &history).unwrap().snapshot(),
         before
     );
-    assert!(replay(&history, target.clone()).is_err());
-    history.push((request.clone(), expansion.clone()));
-    state = replay(&history, original.clone()).unwrap();
-    assert_eq!(state.snapshot().config, target);
-    assert_eq!(state.snapshot().records, before.records);
-    assert!(state.is_quarantined("repair-script", 1));
-    assert!(state.is_quarantined("repair-script", 2));
-    assert!(state.propose("repeat", expansion).is_err());
-    assert!(state.propose("expand", outcome.clone()).is_err());
-    assert!(
-        state
-            .propose(
-                "shrink",
-                KnowledgeCommand::ExpandCapacity {
-                    expected: target.clone(),
-                    target: original.clone()
-                }
-            )
-            .is_err()
-    );
-    assert!(
-        state
-            .propose(
-                "invalid",
-                KnowledgeCommand::ExpandCapacity {
-                    expected: target.clone(),
-                    target: KnowledgeConfig {
-                        max_records: 100_001,
-                        ..target.clone()
+    assert!(replay(target.clone(), &history).is_err());
+    history.push((request, expansion.clone()));
+    state = replay(original.clone(), &history).unwrap();
+    assert_eq!(state.config(), &target);
+    assert_eq!(state.snapshot().experiences, before.experiences);
+    assert!(state.is_quarantined("action", 1));
+    assert!(state.propose("repeat-expand", expansion).is_err());
+    for limit in [0, 1, 2, 100_001] {
+        assert!(
+            state
+                .propose(
+                    "invalid-expansion",
+                    KnowledgeCommand::ExpandCapacity {
+                        expected: target.clone(),
+                        target: KnowledgeConfig { max_records: limit }
                     }
-                }
-            )
-            .is_err()
-    );
-    let pending = state.propose("later", outcome.clone()).unwrap();
-    history.push((pending.request().clone(), outcome));
+                )
+                .is_err()
+        );
+    }
+    let pending = state.propose("second", second.clone()).unwrap();
+    history.push((pending.request().clone(), second));
     state = pending
         .confirm(CommitReceipt::confirmed(&history.last().unwrap().0))
         .unwrap()
         .state;
-    assert_eq!(state.get("a").unwrap().cases.len(), 2);
-    assert!(state.is_quarantined("repair-script", 1));
-    assert!(state.search(&query()).unwrap().is_empty());
-    let mut changed_case = case("unknown", RepairOutcome::Unknown, 1);
-    changed_case.operation_id = "different".into();
-    assert!(
-        state
-            .propose(
-                "id-conflict",
-                KnowledgeCommand::RecordOutcome {
-                    record_id: "a".into(),
-                    case: changed_case,
-                    verification: None
-                }
-            )
-            .is_err()
-    );
-    let mut changed_candidate = candidate("new", 1);
-    changed_candidate.script.source.push_str("changed");
-    assert!(
-        state
-            .propose(
-                "script-conflict",
-                KnowledgeCommand::UpsertCandidate(changed_candidate)
-            )
-            .is_err()
-    );
     assert_eq!(
-        replay(&history, original).unwrap().snapshot(),
+        replay(original, &history).unwrap().snapshot(),
         state.snapshot()
     );
-    let mut bad = history.clone();
-    bad.last_mut().unwrap().0.input[0] = serde_json::json!("0".repeat(64));
+    assert!(state.is_quarantined("action", 1));
     assert!(
-        replay(
-            &bad,
-            KnowledgeConfig {
-                max_records: 2,
-                max_cases_per_record: 1
-            }
+        state
+            .propose("first", command(experience("c", RepairOutcome::Verified)))
+            .is_err()
+    );
+}
+
+#[test]
+fn replay_rejects_altered_commands_history_binding_receipts_and_duplicate_commits() {
+    let original = command(experience("a", RepairOutcome::Verified));
+    let pending = initial().propose("first", original.clone()).unwrap();
+    let request = pending.request().clone();
+    let history = vec![(request.clone(), original.clone())];
+    assert!(replay(KnowledgeConfig::default(), &history).is_ok());
+    let mut altered = history.clone();
+    altered[0].1 = command(experience("b", RepairOutcome::Verified));
+    assert!(replay(KnowledgeConfig::default(), &altered).is_err());
+    let mut altered = history.clone();
+    altered[0].0.input[0] = "altered-digest".into();
+    assert!(replay(KnowledgeConfig::default(), &altered).is_err());
+    let mut altered = history.clone();
+    altered[0].0.revision += 1;
+    assert!(replay(KnowledgeConfig::default(), &altered).is_err());
+    let mut duplicate = history.clone();
+    duplicate.extend(history);
+    assert!(replay(KnowledgeConfig::default(), &duplicate).is_err());
+    let mut wrong = request.clone();
+    wrong.domain = "recovery".into();
+    assert!(
+        KnowledgeState::replay(
+            KnowledgeConfig::default(),
+            vec![KnowledgeReplayEntry {
+                request,
+                command: original,
+                receipt: CommitReceipt::confirmed(&wrong)
+            }]
         )
         .is_err()
     );
+}
+
+#[test]
+fn snapshot_is_complete_and_has_one_experience_protocol() {
+    let empty = serde_json::to_value(initial().snapshot()).unwrap();
+    assert_eq!(empty["experiences"], serde_json::json!([]));
+    assert_eq!(empty.as_object().unwrap().len(), 3);
+    let mut item = experience("a", RepairOutcome::Unknown);
+    item.actions.push(artifact("action", 1));
+    let state = commit(initial(), command(item.clone()));
+    let encoded = serde_json::to_value(state.snapshot()).unwrap();
+    assert_eq!(
+        encoded["experiences"][0],
+        serde_json::to_value(item).unwrap()
+    );
+    assert!(encoded.get("records").is_none());
 }
 
 #[test]
@@ -782,11 +402,13 @@ fn scale_knowledge_commits_bind_incremental_commands() {
     let start = std::time::Instant::now();
     let mut history = Vec::new();
     let mut largest = 0;
-    for i in 0..500 {
-        let command =
-            KnowledgeCommand::UpsertCandidate(candidate(&format!("candidate-{i}"), i + 1));
+    for index in 0..500 {
+        let entry = command(experience(
+            &format!("experience-{index}"),
+            RepairOutcome::Verified,
+        ));
         let pending = state
-            .propose(format!("commit-{i}"), command.clone())
+            .propose(format!("commit-{index}"), entry.clone())
             .unwrap();
         largest = largest.max(serde_json::to_vec(pending.request()).unwrap().len());
         assert!(largest < 2000);
@@ -795,15 +417,11 @@ fn scale_knowledge_commits_bind_incremental_commands() {
             .confirm(CommitReceipt::confirmed(&request))
             .unwrap()
             .state;
-        history.push(KnowledgeReplayEntry {
-            receipt: CommitReceipt::confirmed(&request),
-            request,
-            command,
-        });
+        history.push((request, entry));
     }
     let prepare = start.elapsed();
     let start = std::time::Instant::now();
-    let restored = KnowledgeState::replay(KnowledgeConfig::default(), history).unwrap();
+    let restored = replay(KnowledgeConfig::default(), &history).unwrap();
     let restore = start.elapsed();
     assert_eq!(restored.snapshot(), state.snapshot());
     println!(
