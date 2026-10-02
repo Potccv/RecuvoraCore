@@ -800,6 +800,7 @@ pub(super) fn validate_import(
                 .ok_or_else(|| invalid("legacy Unknown lacks original operation"))?;
             if task.receipt.is_none() {
                 task.receipt = Some(ScriptReceipt {
+                    execution_trace: Vec::new(),
                     operation_id: op.operation_id.clone(),
                     target_id: op.target.clone(),
                     outcome: ScriptOutcome::Unknown,

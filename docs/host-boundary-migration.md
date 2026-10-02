@@ -53,3 +53,9 @@ Host 应在原存储冻结、在途状态已经核实的前提下转换数据，
 5. 未消费待审批保持原操作并进入 Paused，需显式 Resume；执行意图及未知结果保持 Unknown 和脚本隔离，不能自动重发。Publishing 保留原候选、案例 ID 和时间，并按已有证据归类为 Completed、Failed 或 Unknown；即使复用脚本失败后尚有诊断预算，也不在导入时自动续诊断。知识已经提交完全相同案例时不再交付，否则保留有序待交付。导入后的独立核实仍使用原案例身份，历史 Unknown 隔离永久保留。
 
 导入要求全批验证与全批安装，不允许先激活一个领域再补齐其余领域。Host 文件导入、进程中断及所有权切换验证由 Host 项目维护；本库测试只证明上述纯领域规则。
+
+## 统一 Harness 修复接入
+
+新委托显式允许 `repair_with_harness` 后，使用 `RecoveryCommand::StartRepair`；请求无需预先生成脚本。原 `SelectPlan`/`DiagnosisCompleted` 仍用于已有脚本任务。不能直接修改持久聚合绑定的原配置再重放；配置切换须在旧任务和在途执行均已核实后由可信 Host 维护，不能丢弃旧隔离或更换目录绕过所有权。
+
+Host 后端增加独立只读 `summarize`，保存 `RepairActionPrepared` 后才发送具体动作，并在回执中保留 `execution_trace`。空 trace 不序列化，保留旧历史的内容绑定。经验命令存储增加 `RecordExperience`，仅在受保护日志恢复时重建 `TrustedRepairExperience`。新事件和命令不能交给旧二进制解释；升级前保留完整历史，升级后不能直接回退旧写者。

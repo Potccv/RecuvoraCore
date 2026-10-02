@@ -198,6 +198,7 @@ pub struct KnowledgeStatusCounts {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct KnowledgeProjection {
+    pub experiences: usize,
     pub records: usize,
     pub scripts: usize,
     pub cases: usize,
@@ -251,6 +252,7 @@ pub enum KnowledgeError {
 /// Trusted Host inputs. This enum deliberately cannot be deserialized into authority.
 #[derive(Clone, Debug, Serialize)]
 pub enum KnowledgeCommand {
+    RecordExperience(super::TrustedRepairExperience),
     /// Monotonic capacity migration; all domain facts remain intact.
     ExpandCapacity {
         expected: KnowledgeConfig,
@@ -282,6 +284,8 @@ pub struct KnowledgeReplayEntry {
 /// Immutable scripts and all case/disablement facts are retained inside records.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct KnowledgeSnapshot {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub experiences: Vec<super::RepairExperience>,
     pub revision: u64,
     pub config: KnowledgeConfig,
     pub records: Vec<KnowledgeRecord>,

@@ -7,3 +7,6 @@ mod validation;
 
 pub use contract::*;
 pub use state::KnowledgeState;
+
+mod experience;
+pub use experience::*;

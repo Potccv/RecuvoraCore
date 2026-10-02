@@ -30,7 +30,8 @@ impl KnowledgeState {
             }
         }
         KnowledgeProjection {
-            records: self.records.len(),
+            experiences: self.experiences.len(),
+            records: self.records.len() + self.experiences.len(),
             scripts: self.scripts.len(),
             cases: self.cases.len(),
             quarantined_versions: self.quarantined.len(),

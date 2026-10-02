@@ -6,7 +6,7 @@ Core 是单 Cargo 库包 `recuvora-core`，公开顶层模块只有 `operation` 
 
 | 角色 | 职责 |
 | --- | --- |
-| Core | 故障归并与轮次、硬政策和审批、一次许可、恢复状态迁移、结果核实、经验适用性与永久隔离 |
+| Core | 经验匹配、统一修复请求、硬政策与一次许可、结果核实、独立经验总结状态及脚本版本隔离；兼容故障账本与旧脚本任务 |
 | Host | 认证、配置和时间输入、完整历史加载、原子持久提交、当前事实并发校验、目标所有权、外部调用与生命周期 |
 | 存储与查询模块 | Host 选择的持久保存、事务、索引、备份、归档及检索基础设施 |
 | 节点或外部能力模块 | 采集、目标检查、诊断、实际外部动作、进程停止确认及独立业务验收 |
@@ -21,7 +21,7 @@ Harness 指 AI 服务接入；`execution_harness`、`executor_id` 等逻辑身�
 | `IncidentLedger` | 观察提交、人工关注及已提交历史，计算故障和检查点提案 |
 | `ApprovalLedger` | 完整操作、当前政策、审核与结果事实，计算审批提案及确认后的一次许可 |
 | `KnowledgeState` | 候选、可信案例与禁用命令，计算经验提案、精确检索及外部候选校验 |
-| `RecoveryState` | 故障、观察、方案、审批与结果事实，计算恢复提案及确认后的外部操作意图 |
+| `RecoveryState` | 故障、观察、经验、审批与结果事实，计算统一 Harness 请求、结果及独立总结提案 |
 | `Prepared`、`CommitRequest`、`CommitReceipt` | 表达待提交结果、提交内容绑定及可信 Host 的可靠提交确认 |
 
 领域细节由[源码导航](../src/README.md)下的所属 README 维护。旧的存储打开接口、`RepairBackend`、`IncidentGuard`、`TargetOwnership`、`KnowledgeSource` 运行接口不再是当前接入方式；版本迁移见[Host 接入迁移](host-boundary-migration.md)。

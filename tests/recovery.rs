@@ -158,12 +158,13 @@ impl Flow {
         self.task().operation.clone().unwrap()
     }
     fn attach_and_approve(&mut self, op: ProposedOperation) -> String {
+        let active_policy = self.state.config().approval.clone();
         let pending = self
             .approvals
             .prepare_request(
                 format!("request-{}", self.approvals.revision()),
                 op,
-                policy(),
+                active_policy.clone(),
                 100,
             )
             .unwrap();
@@ -186,7 +187,7 @@ impl Flow {
                         timeout_secs: 10,
                     },
                 },
-                Some(&policy()),
+                Some(&active_policy),
                 100,
             )
             .unwrap();
@@ -213,7 +214,7 @@ impl Flow {
                         },
                     },
                 },
-                Some(&policy()),
+                Some(&active_policy),
                 100,
             )
             .unwrap();
@@ -221,6 +222,7 @@ impl Flow {
         id
     }
     fn consume(&mut self, id: &str) -> ExecutionPermit {
+        let active_policy = self.approvals.get(id).unwrap().request.policy.clone();
         let pending = self
             .approvals
             .prepare(
@@ -229,7 +231,7 @@ impl Flow {
                     request_id: id.into(),
                     change: ApprovalChange::Consume,
                 },
-                Some(&policy()),
+                Some(&active_policy),
                 100,
             )
             .unwrap();
@@ -301,6 +303,7 @@ impl Flow {
             task_id: self.id.clone(),
             revision: self.task().revision,
             receipt: ScriptReceipt {
+                execution_trace: Vec::new(),
                 operation_id: op.operation_id.clone(),
                 target_id: "target".into(),
                 outcome: script_outcome,
@@ -1505,6 +1508,7 @@ fn legacy_publication() -> (Vec<LegacyRecoveryRevision>, ApprovalLedger, Knowled
     push_legacy(&mut history, LegacyRecoveryStage::Executing);
     push_legacy(&mut history, LegacyRecoveryStage::Verifying);
     history.last_mut().unwrap().task.receipt = Some(ScriptReceipt {
+        execution_trace: Vec::new(),
         operation_id: "legacy-original-operation".into(),
         target_id: "target".into(),
         outcome: ScriptOutcome::Executed,
@@ -1750,4 +1754,289 @@ fn legacy_task_id_collision_keeps_prior_incident_episode() {
         state.task("task-0000000000000004").unwrap().episode_count,
         2
     );
+}
+
+fn unified_started() -> (Flow, String, ExecutionPermit) {
+    let mut settings = config();
+    settings.approval.allowed_action_kinds = vec!["repair_with_harness".into()];
+    let mut flow = Flow::new();
+    flow.state = RecoveryState::new(settings).unwrap();
+    flow.register("unified-incident");
+    let pending = flow
+        .state
+        .prepare(
+            "start-harness",
+            RecoveryCommand::StartRepair {
+                task_id: flow.id.clone(),
+                revision: flow.task().revision,
+                observation: observation(),
+            },
+            100_000,
+            &flow.knowledge,
+        )
+        .unwrap();
+    assert_eq!(flow.task().stage, RecoveryStage::Queued);
+    let (state, effects) = commit(pending);
+    flow.state = state;
+    assert!(matches!(
+        effects.as_slice(),
+        [RecoveryEffect::RequestApproval { .. }]
+    ));
+    assert!(flow.task().plan.is_none());
+    assert_eq!(flow.task().diagnosis_attempts, 0);
+    let op = flow.task().operation.clone().unwrap();
+    let request: HarnessRepairRequest =
+        serde_json::from_value(op.action["request"].clone()).unwrap();
+    assert!(request.experiences.is_empty());
+    assert!(request.summarize_experience && request.assess_scriptability);
+    let id = flow.attach_and_approve(op);
+    let permit = flow.dispatch(&id);
+    (flow, id, permit)
+}
+fn report_without_script() -> ExperienceReport {
+    ExperienceReport {
+        summary: "repair findings".into(),
+        lessons: "An interactive diagnosis was required".into(),
+        related_experience_ids: vec![],
+        scriptability: Scriptability::NotSuitable {
+            reason: "Requires contextual judgment".into(),
+        },
+    }
+}
+fn summarize(flow: &mut Flow) -> ExperienceJob {
+    let job = flow.state.pending_experiences()[0].clone();
+    let effects = flow.step(RecoveryEvent::BeginExperience {
+        job_id: job.id.clone(),
+    });
+    let RecoveryEffect::SummarizeExperience { call_id, .. } = &effects[0] else {
+        panic!("summary effect");
+    };
+    flow.step(RecoveryEvent::ExperienceSummarized {
+        job_id: job.id.clone(),
+        call_id: call_id.clone(),
+        report: report_without_script(),
+    });
+    flow.state.pending_experiences()[0].clone()
+}
+#[test]
+fn unified_repair_supports_script_free_experience_and_matches_it_next_time() {
+    let (mut flow, _, permit) = unified_started();
+    flow.record(permit, ExecutionOutcome::Executed);
+    flow.verify(Some(true));
+    assert_eq!(flow.task().stage, RecoveryStage::Completed);
+    assert!(flow.state.pending_deliveries().is_empty());
+    let job = summarize(&mut flow);
+    let experience = job.record("linux").unwrap();
+    let pending = flow
+        .knowledge
+        .propose(
+            "experience",
+            KnowledgeCommand::RecordExperience(
+                TrustedRepairExperience::attest(experience.clone()).unwrap(),
+            ),
+        )
+        .unwrap();
+    assert!(flow.knowledge.snapshot().experiences.is_empty());
+    flow.knowledge = commit(pending).0;
+    flow.step(RecoveryEvent::ExperienceDelivered { job_id: job.id });
+    flow.register("another-incident");
+    flow.state = commit(
+        flow.state
+            .prepare(
+                "known-harness",
+                RecoveryCommand::StartRepair {
+                    task_id: flow.id.clone(),
+                    revision: flow.task().revision,
+                    observation: observation(),
+                },
+                100_000,
+                &flow.knowledge,
+            )
+            .unwrap(),
+    )
+    .0;
+    let request: HarnessRepairRequest =
+        serde_json::from_value(flow.task().operation.as_ref().unwrap().action["request"].clone())
+            .unwrap();
+    assert_eq!(request.experiences, vec![experience]);
+    assert!(flow.task().plan.is_none());
+}
+#[test]
+fn summary_failure_and_restart_do_not_change_result_or_reissue_execution() {
+    let (mut flow, _, permit) = unified_started();
+    flow.record(permit, ExecutionOutcome::Executed);
+    flow.verify(Some(true));
+    let job = flow.state.pending_experiences()[0].clone();
+    let effects = flow.step(RecoveryEvent::BeginExperience {
+        job_id: job.id.clone(),
+    });
+    let RecoveryEffect::SummarizeExperience { call_id, .. } = &effects[0] else {
+        panic!()
+    };
+    flow.state = RecoveryState::restore(flow.state.config().clone(), flow.state.entries()).unwrap();
+    let effects = flow.step(RecoveryEvent::Recover);
+    assert!(effects.is_empty());
+    assert!(
+        flow.state
+            .prepare(
+                "late-summary",
+                RecoveryCommand::Event(RecoveryEvent::ExperienceSummarized {
+                    job_id: job.id.clone(),
+                    call_id: call_id.clone(),
+                    report: report_without_script(),
+                }),
+                100_000,
+                &flow.knowledge
+            )
+            .is_err()
+    );
+    assert_eq!(flow.task().stage, RecoveryStage::Completed);
+    let retried = summarize(&mut flow);
+    assert_eq!(retried.id, job.id);
+    assert_eq!(retried.attempt, 2);
+    assert_eq!(flow.task().stage, RecoveryStage::Completed);
+}
+#[test]
+fn harness_repair_requires_explicit_policy_and_cannot_be_forged_as_event() {
+    let mut flow = Flow::new();
+    flow.register("incident");
+    assert!(
+        flow.state
+            .prepare(
+                "not-delegated",
+                RecoveryCommand::StartRepair {
+                    task_id: flow.id.clone(),
+                    revision: flow.task().revision,
+                    observation: observation(),
+                },
+                100_000,
+                &flow.knowledge
+            )
+            .is_err()
+    );
+    assert_eq!(flow.task().stage, RecoveryStage::Queued);
+    let (flow, _, _) = unified_started();
+    let request: HarnessRepairRequest =
+        serde_json::from_value(flow.task().operation.as_ref().unwrap().action["request"].clone())
+            .unwrap();
+    assert!(
+        flow.state
+            .prepare(
+                "forged",
+                RecoveryCommand::Event(RecoveryEvent::RepairRequested {
+                    task_id: flow.id.clone(),
+                    revision: flow.task().revision,
+                    request,
+                }),
+                100_000,
+                &flow.knowledge
+            )
+            .is_err()
+    );
+}
+#[test]
+fn interrupted_harness_action_retains_exact_action_and_quarantine() {
+    let (mut flow, _, _) = unified_started();
+    let mut script = plan(1).script;
+    script.id = format!(
+        "{}-action",
+        flow.task().operation.as_ref().unwrap().operation_id
+    );
+    flow.step(RecoveryEvent::RepairActionPrepared {
+        task_id: flow.id.clone(),
+        revision: flow.task().revision,
+        script: script.clone(),
+    });
+    assert!(
+        flow.state
+            .prepare(
+                "second-action",
+                RecoveryCommand::Event(RecoveryEvent::RepairActionPrepared {
+                    task_id: flow.id.clone(),
+                    revision: flow.task().revision,
+                    script: script.clone(),
+                }),
+                100_000,
+                &flow.knowledge
+            )
+            .is_err()
+    );
+    flow.state = RecoveryState::restore(flow.state.config().clone(), flow.state.entries()).unwrap();
+    assert_eq!(
+        flow.state
+            .repair_action(&flow.task().operation.as_ref().unwrap().operation_id),
+        Some(&script)
+    );
+    let effects = flow.step(RecoveryEvent::Recover);
+    assert!(
+        effects
+            .iter()
+            .all(|e| !matches!(e, RecoveryEffect::Execute { .. }))
+    );
+    assert_eq!(flow.task().stage, RecoveryStage::Unknown);
+    assert_eq!(
+        flow.task().receipt.as_ref().unwrap().execution_trace,
+        vec![script.clone()]
+    );
+    assert!(flow.state.is_quarantined(&script.id, script.version));
+    assert!(
+        flow.state
+            .prepare(
+                "new-incident",
+                RecoveryCommand::Event(RecoveryEvent::Register {
+                    problem: problem("next"),
+                    incident: IncidentEvidence {
+                        incident_id: "next".into(),
+                        revision: 1,
+                        active: true
+                    },
+                }),
+                100_000,
+                &flow.knowledge
+            )
+            .is_err()
+    );
+}
+#[test]
+fn generated_candidate_is_not_verified_by_the_successful_harness_repair() {
+    let (mut flow, _, permit) = unified_started();
+    flow.record(permit, ExecutionOutcome::Executed);
+    flow.verify(Some(true));
+    let job = flow.state.pending_experiences()[0].clone();
+    let effects = flow.step(RecoveryEvent::BeginExperience {
+        job_id: job.id.clone(),
+    });
+    let RecoveryEffect::SummarizeExperience { call_id, .. } = &effects[0] else {
+        panic!()
+    };
+    let mut report = report_without_script();
+    report.scriptability = Scriptability::Possible {
+        reason: "Can be automated but not tested".into(),
+        candidate: Some(plan(8).script),
+    };
+    flow.step(RecoveryEvent::ExperienceSummarized {
+        job_id: job.id,
+        call_id: call_id.clone(),
+        report,
+    });
+    let job = flow.state.pending_experiences()[0].clone();
+    let item = job.record("linux").unwrap();
+    flow.knowledge = commit(
+        flow.knowledge
+            .propose(
+                "candidate-experience",
+                KnowledgeCommand::RecordExperience(
+                    TrustedRepairExperience::attest(item.clone()).unwrap(),
+                ),
+            )
+            .unwrap(),
+    )
+    .0;
+    let query = KnowledgeQuery {
+        conditions: item.conditions,
+        keywords: item.keywords,
+        limit: 4,
+    };
+    assert_eq!(flow.knowledge.search_experiences(&query).unwrap().len(), 1);
+    assert!(flow.knowledge.search_reusable(&query).unwrap().is_empty());
 }

@@ -2,7 +2,24 @@
 
 `RecoveryState` 计算流程，Host 加载和提交状态并执行操作意图。接口见[状态机实现](../src/recovery/workflow/service/README.md)，提交职责见[架构](architecture.md)。
 
-## 正常流程
+## 统一 Harness 修复
+
+1. `Register` 登记当前活动故障，重复故障身份不会产生第二次修复，同目标非终态和 Unknown 继续阻塞。
+2. Host 提供当前观察并调用 `RecoveryCommand::StartRepair`。Core 根据环境、故障指纹和关键词精确检索最多四条经验，组成 `HarnessRepairRequest`；未命中时经验列表为空。已有脚本案例也可以作为参考，命中不授予执行权限。知识输入或检索错误不能解释为未命中。
+3. 请求包含故障、观察、参考经验、逻辑 Harness、目标限制、工具预算和可信委托，并要求总结经验与评估脚本化。`approval.allowed_action_kinds` 必须显式包含 `repair_with_harness`；Core 先提交完整请求，再沿现有审批和一次许可边界交由 Host 执行。
+4. Harness 内部诊断与工具调用由 Host 管理。当前接口允许一次有界变更动作；Host 在实际发送前提交 `RepairActionPrepared`，保存具体脚本及其归属，动作 ID 固定绑定原操作，第二个变更被拒绝。`ScriptReceipt.execution_trace` 必须与已提交动作一致。Core 不要求修复前存在可复用脚本或 `RepairPlan`。
+5. 执行结果及独立业务验收沿用 `ExecutionRecorded`、`VerificationRecorded` 和 Unknown 核实规则。实际动作失败或 Unknown 的版本隔离先与结果一并提交；恢复不重发动作，保存的动作内容仍可审计。
+6. 结果提交同时建立稳定的 `ExperienceJob`。Host 提交 `BeginExperience` 后才取得 `SummarizeExperience`，以独立只读 Harness 会话生成 `ExperienceReport`，回传 `ExperienceSummarized` 或 `ExperienceFailed`。回调绑定调用身份，恢复会使旧回调失效；总结失败不改变业务结果，也不重新执行修复。
+7. Host 从已完成总结的任务生成 `RepairExperience`，通过知识域的 `TrustedRepairExperience::attest` 与 `RecordExperience` 可靠提交后，再提交 `ExperienceDelivered`。经验身份固定，完全相同重试幂等；成功、失败和 Unknown 是独立保存的事实，后来的成功不撤销早期隔离。
+
+`ExperienceReport` 包含总结、经验教训、使用或修正的输入经验 ID，以及 `Scriptability`。`Possible` 允许附带脚本候选；`NotSuitable` 与 `Undetermined` 必须说明原因且不带脚本。引用只能来自该次请求的经验列表。事后脚本候选只保留不可变内容，不进入已验证脚本检索、不继承本次业务验收、不产生许可；后续由 Harness 判断其适用性。
+
+`pending_experiences()` 与 `pending_deliveries()` 分别提供新总结工作和旧案例交付。Host 应分别重试总结与保存，保留已成功部分；Core 不进行调度，也不把经验服务可用性作为已经完成业务的终态条件。
+
+## 兼容脚本流程
+
+以下路径用于已有脚本方案和未切换委托的接入方。新统一修复入口不经过前置脚本生成或按故障轮次自动选择脚本。
+
 
 1. `Register` 根据当前活动故障登记任务。同一故障身份去重，同目标已有未结束任务拒绝新登记；独立故障轮次用于复用阈值。
 2. Host 检查环境并提供 `SelectPlan`。有效的本地已验证候选进入审批；无候选时，在提交中记录诊断次数和调用身份，确认后返回 `Diagnose`。

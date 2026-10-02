@@ -85,7 +85,7 @@ impl RecoveryConfig {
                 || !policy
                     .allowed_action_kinds
                     .iter()
-                    .any(|kind| kind == "execute_script")
+                    .any(|kind| matches!(kind.as_str(), "execute_script" | "repair_with_harness"))
             {
                 return Err(RecoveryError::Invalid(
                     "target/script action not explicitly delegated".into(),
@@ -191,6 +191,9 @@ pub enum ScriptOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScriptReceipt {
+    /// Actual actions supplied by the trusted backend, never by the model's final text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execution_trace: Vec<ScriptArtifact>,
     pub operation_id: String,
     pub target_id: String,
     pub outcome: ScriptOutcome,

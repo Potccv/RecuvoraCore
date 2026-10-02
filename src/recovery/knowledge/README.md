@@ -2,10 +2,17 @@
 
 `recovery::knowledge` 提供纯逻辑的经验登记、可信验收校验、永久版本隔离及精确检索。`KnowledgeState` 不打开文件、不连接存储、不调用外部知识源；Host 负责读取完整可信历史、原子提交、索引与归档。领域关系见[恢复领域](../README.md)。
 
+## 无脚本经验
+
+`RepairExperience` 保存操作身份、目标、精确适用条件、关键词、可信结果和证据，以及模型提出的 `ExperienceReport`。经验不要求脚本；`Scriptability` 区分可脚本化、不适合和信息不足。Host 只能从受保护的恢复结果构造 `TrustedRepairExperience::attest`，再提交 `KnowledgeCommand::RecordExperience`；模型不能反序列化该权威断言。
+
+`search_experiences` 精确匹配条件和关键词，按结果记录时间降序、ID 升序返回。失败和 Unknown 也作为明确标记的参考信息保留，不能当作成功修复方案；查询错误不同于空结果。候选脚本仅登记不可变版本，不进入 `search_reusable`，也不继承业务成功。旧案例与新经验共同占用 `max_records`；`snapshot.experiences` 完整导出经验，`projection.experiences` 返回数量。相同经验 ID 仅接受完全相同内容，重放使用同一校验。
+
 ## 源码导航
 
 | 文件 | 职责 |
 | --- | --- |
+| [experience.rs](experience.rs) | 独立于脚本的经验、脚本化评估、可信结果断言与检索 |
 | [contract.rs](contract.rs) | 候选、不可变脚本、案例、可信验收、输入命令与逻辑容量 |
 | [state.rs](state.rs) | 纯状态迁移、提交提案、逐条历史恢复与隔离 |
 | [validation.rs](validation.rs) | 有界输入、适用条件及可信验收关联校验 |

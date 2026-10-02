@@ -8,6 +8,7 @@ use im::OrdSet;
 /// There is intentionally no unchecked deserialization constructor.
 #[derive(Clone, Debug)]
 pub struct KnowledgeState {
+    pub(super) experiences: Map<String, RepairExperience>,
     pub(super) config: KnowledgeConfig,
     revision: u64,
     digest: String,
@@ -26,6 +27,7 @@ impl KnowledgeState {
             commit_ids: OrdSet::new(),
             config,
             revision: 0,
+            experiences: Map::new(),
             records: Map::new(),
             scripts: Map::new(),
             cases: Map::new(),
@@ -55,6 +57,21 @@ impl KnowledgeState {
         }
         if let KnowledgeCommand::ExpandCapacity { target, .. } = &command {
             state.config = target.clone();
+        }
+        if let KnowledgeCommand::RecordExperience(proof) = &command {
+            let experience = proof.record();
+            if let Scriptability::Possible {
+                candidate: Some(script),
+                ..
+            } = &experience.report.scriptability
+            {
+                state
+                    .scripts
+                    .insert((script.id.clone(), script.version), script.clone());
+            }
+            state
+                .experiences
+                .insert(experience.id.clone(), experience.clone());
         }
         state.revision = next(self.revision)?;
         let input = serde_json::to_value((&self.digest, &self.config, &command))
@@ -100,6 +117,7 @@ impl KnowledgeState {
     /// Use ordered committed commands for validated replay.
     pub fn snapshot(&self) -> KnowledgeSnapshot {
         KnowledgeSnapshot {
+            experiences: self.experiences.values().cloned().collect(),
             revision: self.revision,
             config: self.config.clone(),
             records: self.records.values().cloned().collect(),
@@ -200,6 +218,29 @@ impl KnowledgeState {
         event: &KnowledgeCommand,
     ) -> Result<Option<KnowledgeRecord>, KnowledgeError> {
         match event {
+            KnowledgeCommand::RecordExperience(proof) => {
+                let item = proof.record();
+                if let Some(old) = self.experiences.get(&item.id) {
+                    return if old == item {
+                        Ok(None)
+                    } else {
+                        Err(KnowledgeError::Conflict(
+                            "experience identity changed".into(),
+                        ))
+                    };
+                }
+                if self.records.len() + self.experiences.len() >= self.config.max_records {
+                    return Err(KnowledgeError::Capacity("experience records".into()));
+                }
+                if let Scriptability::Possible {
+                    candidate: Some(script),
+                    ..
+                } = &item.report.scriptability
+                {
+                    self.validate_script(script)?;
+                }
+                Ok(None)
+            }
             KnowledgeCommand::ExpandCapacity { expected, target } => {
                 target.validate()?;
                 if expected != &self.config
@@ -223,7 +264,7 @@ impl KnowledgeState {
                     };
                 }
                 self.validate_script(&candidate.script)?;
-                if self.records.len() >= self.config.max_records {
+                if self.records.len() + self.experiences.len() >= self.config.max_records {
                     return Err(KnowledgeError::Capacity("knowledge records".into()));
                 }
                 Ok(Some(KnowledgeRecord {

@@ -6,7 +6,14 @@
 | --- | --- |
 | [contract.rs](contract.rs) | 配置、任务、方案、执行与独立业务验收证据 |
 | [engine.rs](engine.rs) | 命令、历史事件、提交提案、流程迁移与经验待交付记录 |
+| [experience.rs](experience.rs) | 统一修复请求、独立经验任务及结果转换 |
 | [query.rs](query.rs) | `RecoveryTaskSummary` 与 `RecoveryNextStep` 结构化进度 |
+
+## 统一修复入口
+
+`RecoveryCommand::StartRepair` 根据当前知识生成带可选经验的 `HarnessRepairRequest`，无论是否命中经验都采用同一受授权 Harness 会话。请求政策显式允许 `repair_with_harness`，执行前不要求 `RepairPlan`。`RepairActionPrepared` 在发送前保存会话内具体动作，最多一次；`repair_action(operation_id)` 查询已提交动作，不产生许可，结果的 `execution_trace` 保留其内容及版本。
+
+`ExperienceJob` 在业务结果提交时创建；`BeginExperience` 确认后产生只读总结效果，`ExperienceSummarized` 保存总结及可选候选，`ExperienceFailed` 保留重试状态。`pending_experiences()` 返回未交付工作，`ExperienceDelivered` 只在 Host 保存经验后确认。完整流程与旧脚本兼容路径见[恢复流程](../../../../docs/recovery.md)。
 
 ## 使用与提交
 
