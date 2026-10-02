@@ -13,4 +13,4 @@
 
 领域测试不需要运行目录；开发脚本测试需要的临时数据放源码外 RECUVORA_TEST_TEMP，构建统一使用源码外 CARGO_TARGET_DIR，只清理本次创建的资源。
 
-纯状态测试中的 `CommitReceipt::confirmed` 是可信 Host 的模拟确认，不能证明真实持久化和原子版本比较。文件格式、事务、锁、进程停止、网络传输和真实业务验收由 Host/执行端集成测试负责。验证结果与未运行限制统一维护在[实现状态](implementation-status.md)。
+纯状态测试中的 `CommitReceipt::confirmed` 是可信调用方的模拟确认，不能证明真实持久化和原子版本比较。文件格式、事务、锁、进程停止、网络传输和真实业务验收由调用方/执行端集成测试负责。验证结果与未运行限制统一维护在[实现状态](implementation-status.md)。

@@ -18,7 +18,7 @@ pub enum ReviewerConfig {
     },
 }
 
-/// Loaded by the host from trusted configuration, outside AI-writable targets.
+/// Loaded by the caller from trusted configuration, outside AI-writable targets.
 /// Target and action-kind lists are exact matches and hard limits for all reviewers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -125,7 +125,7 @@ pub enum ApprovalDecision {
     Escalate,
 }
 
-/// This is the entire model response. Reviewer identity is supplied by the host.
+/// This is the entire model response. Reviewer identity is supplied by the caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelAssessment {
@@ -189,7 +189,7 @@ pub enum ReviewStage {
     Finished,
 }
 
-/// Host-owned correlation for one durable, bounded review attempt.
+/// Caller-supplied correlation for one durable, bounded review attempt.
 /// Model output must never supply these fields or the reviewer identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

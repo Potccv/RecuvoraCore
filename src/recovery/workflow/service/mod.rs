@@ -1,4 +1,4 @@
-//! Pure recovery transitions and Host-owned commit/execution contracts.
+//! Pure recovery transitions and caller-owned commit/execution contracts.
 mod contract;
 mod engine;
 mod experience;

@@ -1,11 +1,11 @@
-//! Neutral repair artifacts, exact queries and trusted Host commands.
+//! Neutral repair artifacts, exact queries and trusted caller commands.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const MAX_ARTIFACT_BYTES: usize = 32 * 1024;
 
-/// Immutable content for one `(id, version)`. The Host interprets kind and payload.
+/// Immutable content for one `(id, version)`. The caller interprets kind and payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepairArtifact {
@@ -83,7 +83,7 @@ pub enum KnowledgeError {
     Commit(#[from] crate::operation::CommitError),
 }
 
-/// Trusted Host inputs; this enum cannot be deserialized into authority.
+/// Trusted caller inputs; this enum cannot be deserialized into authority.
 #[derive(Clone, Debug, Serialize)]
 pub enum KnowledgeCommand {
     RecordExperience(super::TrustedRepairExperience),
@@ -94,7 +94,7 @@ pub enum KnowledgeCommand {
     },
 }
 
-/// Reconstructed only from the Host's protected, complete committed history.
+/// Reconstructed only from the caller's protected, complete committed history.
 pub struct KnowledgeReplayEntry {
     pub request: crate::operation::CommitRequest,
     pub command: KnowledgeCommand,

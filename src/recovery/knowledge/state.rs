@@ -1,10 +1,10 @@
-//! Deterministic experience decisions; the Host owns storage and serialization.
+//! Deterministic experience decisions; the caller owns storage and serialization.
 use super::{validation, *};
 use crate::collections::Map;
 use crate::operation::Prepared;
 use im::OrdSet;
 
-/// Validated authority built only through proposals and confirmed Host commits.
+/// Validated authority built only through proposals and confirmed caller commits.
 #[derive(Clone, Debug)]
 pub struct KnowledgeState {
     pub(super) experiences: Map<String, RepairExperience>,
@@ -116,7 +116,7 @@ impl KnowledgeState {
         )?)
     }
 
-    /// Repeats live validation for the Host's complete, ordered committed history.
+    /// Repeats live validation for the caller's complete, ordered committed history.
     pub fn replay(
         config: KnowledgeConfig,
         entries: Vec<KnowledgeReplayEntry>,

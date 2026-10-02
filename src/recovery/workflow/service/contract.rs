@@ -6,7 +6,7 @@ pub(super) const FAULT_FINGERPRINT_CONDITION: &str = "fault_fingerprint";
 #[serde(deny_unknown_fields)]
 pub struct TargetBinding {
     pub target_id: String,
-    /// Stable logical executor identity. Host owns how this identity is routed.
+    /// Stable logical executor identity; no transport or routing configuration.
     pub executor_id: String,
     pub allowed_action_kinds: Vec<String>,
     pub verification_profile: String,
@@ -18,7 +18,7 @@ pub struct TargetBinding {
 #[serde(deny_unknown_fields)]
 pub struct RecoveryConfig {
     pub schema_version: u32,
-    /// Logical Harness identity selected by policy; Host resolves its route/workspace.
+    /// Logical Harness identity selected by policy, independent of service routing.
     pub execution_harness: String,
     pub target: TargetBinding,
     pub approval: approval::ApprovalPolicy,
@@ -188,7 +188,7 @@ pub enum RepairExecutionOutcome {
     Unknown,
 }
 
-/// Domain result returned by the external executor through the Host adapter.
+/// Domain result returned by the external executor through a trusted adapter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepairReceipt {

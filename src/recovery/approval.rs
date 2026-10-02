@@ -1,7 +1,7 @@
 //! Pure approval decisions and commit-gated execution capabilities.
 //!
-//! Callers are trusted host code: this is not an authentication boundary against
-//! arbitrary code in the host process. Model output is evidence, never a permit.
+//! Callers are trusted integration code: this is not an authentication boundary against
+//! arbitrary code in the calling process. Model output is evidence, never a permit.
 
 mod contract;
 mod ledger;
@@ -23,7 +23,7 @@ pub use contract::{
 };
 
 /// A one-use, non-cloneable capability produced only after the execution intent
-/// was confirmed by the trusted Host. It does not implement Deserialize and its fields are private.
+/// was confirmed by the trusted caller. It does not implement Deserialize and its fields are private.
 #[derive(Debug)]
 pub struct ExecutionPermit {
     request_id: String,
@@ -57,7 +57,7 @@ pub struct ApprovalEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalEvent {
-    /// Explicit Host restart recovery; never dispatches a stored intent.
+    /// Explicit caller restart recovery; never dispatches a stored intent.
     Recover,
     Requested {
         request: ApprovalRequest,
@@ -110,7 +110,7 @@ pub enum ApprovalChange {
     },
 }
 
-/// Pure approval aggregate. Host atomically commits its history and aggregate revision.
+/// Pure approval aggregate. The caller atomically commits its history and aggregate revision.
 /// Restoring history produces no executable effects.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApprovalLedger {
@@ -130,7 +130,7 @@ pub struct ApprovalLedger {
     identity: Arc<()>,
 }
 
-/// Released only after the Host confirms a successful durable commit.
+/// Released only after the caller confirms a successful durable commit.
 #[derive(Debug)]
 pub enum ApprovalEffect {
     Execute(ExecutionPermit),

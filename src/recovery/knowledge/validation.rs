@@ -1,4 +1,4 @@
-//! Bounded neutral content; concrete action formats belong to the Host.
+//! Bounded neutral content; concrete action formats belong to the caller.
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 

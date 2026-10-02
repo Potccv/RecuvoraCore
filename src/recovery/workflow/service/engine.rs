@@ -1,10 +1,10 @@
-//! Deterministic workflow. All I/O, clocks, scheduling and commit CAS belong to Host.
+//! Deterministic workflow. Time and facts are inputs; effects require commit confirmation.
 use super::contract::{FAULT_FINGERPRINT_CONDITION, evidence, facts, stable_conditions};
 use super::*;
 use crate::operation::{CommitRequest, Prepared};
 use approval::{ApprovalRecord, ApprovalState, ExecutionPermit};
 
-/// Host must hold this logical ownership epoch through commit and dispatch.
+/// The caller must hold this logical ownership epoch through commit and dispatch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetAuthority {
@@ -12,7 +12,7 @@ pub struct TargetAuthority {
     pub epoch: String,
 }
 
-/// Current trusted incident fact. Host must check its revision atomically with
+/// Current trusted incident fact. The caller must check its revision atomically with
 /// execution authorization, or hold its incident gate through that commit.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,7 +22,7 @@ pub struct IncidentEvidence {
     pub active: bool,
 }
 
-/// Data Host persists. Loading it never dispatches an external operation.
+/// Committed history data. Loading it never dispatches an external operation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RecoveryEvent {
@@ -235,7 +235,7 @@ impl RecoveryState {
         self.quarantined.contains(&(id.into(), version))
     }
 
-    /// Host persists the new entry and compares request.expected_revision, then
+    /// The caller persists the new entry and compares request.expected_revision, then
     /// confirms. Commit failure/uncertainty grants no effect; reload before retry.
     pub fn prepare(
         &self,
@@ -393,7 +393,7 @@ impl RecoveryState {
         )?)
     }
 
-    /// Host supplies complete, committed history from protected storage. Replay
+    /// The caller supplies complete, committed history from protected storage. Replay
     /// never returns effects/permits. Persist Recover before resuming any work.
     pub fn restore(
         config: RecoveryConfig,
@@ -1150,7 +1150,7 @@ impl RecoveryState {
                 if !allowed {
                     return Err(invalid("result check conflicts with approval"));
                 }
-                // The prepared event carries evidence. Host must reconcile the
+                // The prepared event carries evidence. The caller must reconcile the
                 // approval first or in the same atomic transaction before release.
 
                 task.result_check = Some(ResultCheckRecord {

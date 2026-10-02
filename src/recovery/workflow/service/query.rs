@@ -1,4 +1,4 @@
-//! Structured domain progress; Host owns pagination storage and scheduling.
+//! Structured domain progress and bounded in-memory queries.
 use super::*;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

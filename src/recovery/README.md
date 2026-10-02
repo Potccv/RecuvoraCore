@@ -9,4 +9,4 @@
 | [知识](knowledge/README.md) | `KnowledgeState`：可信修复经验、实际动作与候选、不可变版本、永久隔离、精确检索 |
 | [流程](workflow/README.md) | `RecoveryState`：统一 Harness 修复、动作绑定、审批关联、结果核实与独立经验总结 |
 
-所有领域状态由 Host 持久化。规则见[恢复领域规范](AGENTS.md)。
+所有领域状态由调用方持久化。规则见[恢复领域规范](AGENTS.md)。

@@ -71,7 +71,7 @@ pub struct RepairExperience {
     pub report: ExperienceReport,
 }
 
-/// Only trusted Host code may attest a persisted result; model JSON cannot do so.
+/// Only trusted caller code may attest a persisted result; model JSON cannot do so.
 #[derive(Clone, Debug, Serialize)]
 pub struct TrustedRepairExperience(Box<RepairExperience>);
 impl TrustedRepairExperience {

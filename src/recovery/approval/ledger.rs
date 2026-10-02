@@ -1,4 +1,4 @@
-//! Pure preparation, Host-confirmed effects, and validated history replay.
+//! Pure preparation, caller-confirmed effects, and validated history replay.
 use super::*;
 
 impl ApprovalLedger {
@@ -16,7 +16,7 @@ impl ApprovalLedger {
         })
     }
 
-    /// Host supplies complete, committed history. No call or execution is replayed.
+    /// The caller supplies complete, committed history. No call or execution is replayed.
     /// Executing records remain blocking until `RecoverUnknown` is committed.
     pub fn restore(
         config: ApprovalLimits,
@@ -37,7 +37,7 @@ impl ApprovalLedger {
         self.recovery_required
     }
 
-    /// Host confirms this aggregate recovery before any resumed authorization.
+    /// The caller confirms this aggregate recovery before any resumed authorization.
     pub fn prepare_recovery(
         &self,
         commit_id: String,
@@ -68,9 +68,9 @@ impl ApprovalLedger {
         self.records.values().cloned().collect()
     }
 
-    /// Validates without changing this aggregate. Host must atomically compare
+    /// Validates without changing this aggregate. The caller must atomically compare
     /// the expected aggregate revision and persist before confirming the result.
-    /// Use a unique Host transaction ID for every preparation, including retries.
+    /// Use a unique caller transaction ID for every preparation, including retries.
     pub fn prepare(
         &self,
         commit_id: String,
@@ -217,7 +217,7 @@ impl ApprovalLedger {
     }
 
     /// A capability consumed by this function cannot be reused. A failed or
-    /// uncertain Host commit must be resolved through the persisted intent.
+    /// uncertain caller commit must be resolved through the persisted intent.
     pub fn prepare_complete(
         &self,
         commit_id: String,

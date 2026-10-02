@@ -1,9 +1,9 @@
-//! Pure commit proposals. The trusted Host owns durable compare-and-swap.
+//! Pure commit proposals. The trusted caller owns durable compare-and-swap.
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Exact logical transaction binding; this is domain data, not a storage format.
-/// Host scopes `id` and revision to the correct aggregate, atomically compares
+/// The caller scopes `id` and revision to the correct aggregate, atomically compares
 /// the prior revision and persists the complete proposal. Reusing an ID with
 /// different domain/input is a conflict, never a successful retry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,7 +40,7 @@ impl CommitRequest {
 
 /// Trusted assertion that this exact proposal was durably committed.
 /// Not authentication; never expose this constructor to model tools. Confirming
-/// the same transaction twice must not release its effects twice. Host resolves
+/// the same transaction twice must not release its effects twice. The caller resolves
 /// uncertain commits from protected history and restores state without effects.
 #[derive(Debug)]
 pub struct CommitReceipt(CommitRequest);
@@ -60,7 +60,7 @@ pub enum CommitError {
     ReceiptMismatch,
 }
 
-/// Proposed state may be exported by Host. Effects are private until commit.
+/// Proposed state may be exported by the caller. Effects are private until commit.
 /// Dropping a proposal never changes the input state. The bound input contains
 /// a versioned commitment to prior configuration/history and the complete new
 /// transition input; it must not recursively embed prior commit requests.
@@ -101,7 +101,7 @@ impl<S, E> Prepared<S, E> {
         })
     }
 }
-/// Install after successful Host commit; dispatch effects at most once.
+/// Install after a successful commit confirmation; dispatch effects at most once.
 /// Restart recovery must not reconstruct executable effects.
 #[derive(Debug)]
 pub struct Committed<S, E = ()> {

@@ -1,8 +1,8 @@
-//! Pure recovery decisions, state transitions and Host commit proposals.
+//! Pure recovery decisions, state transitions and commit proposals.
 //!
-//! The trusted Host owns durable storage, atomic version checks, authentication,
-//! scheduling, target ownership, external calls and process supervision. Core
-//! validates their domain inputs and releases effects after commit confirmation.
+//! Facts, time and evidence are explicit trusted inputs. Core performs no I/O
+//! or scheduling; it releases new state and effects only after a matching commit
+//! confirmation. Public modules define operation and recovery contracts.
 mod binding;
 mod collections;
 mod identity;

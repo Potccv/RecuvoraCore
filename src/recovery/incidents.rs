@@ -53,7 +53,7 @@ struct MonitorState {
     updated_at_ms: u64,
 }
 
-/// Pure incident aggregate; Host owns durable storage and atomic revision checks.
+/// Pure incident aggregate; the caller owns durable storage and atomic revision checks.
 #[derive(Debug, Clone, Serialize)]
 pub struct IncidentLedger {
     #[serde(skip)]

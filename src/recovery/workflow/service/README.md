@@ -19,9 +19,9 @@
 
 ## 使用与提交
 
-`new(config)` 创建空状态；`prepare(commit_id, command, now_ms, knowledge)` 返回 `Prepared<RecoveryState, RecoveryEffect>`。准备不修改原状态；Host 持久保存新增 `RecoveryEntry` 及提交身份，原子比较聚合版本后调用 `confirm`，再安装结果并处理效果。请求绑定配置、先前完整历史摘要、完整事件与时间。
+`new(config)` 创建空状态；`prepare(commit_id, command, now_ms, knowledge)` 返回 `Prepared<RecoveryState, RecoveryEffect>`。准备不修改原状态；调用方持久保存新增 `RecoveryEntry` 及提交身份，原子比较聚合版本后调用 `confirm`，再安装结果并处理效果。请求绑定配置、先前完整历史摘要、完整事件与时间。
 
-执行只通过 `AuthorizeExecution`，要求审批域确认消费后返回的 `ExecutionPermit`；流程确认后通过 `RecoveryEffect::Execute` 交付许可。Host 持续保证目标所有权和当前故障条件，`TargetAuthority` 不是分布式锁。观察、验收和核实证据接受最多 30 秒的新鲜度窗口；时间由可信调用方显式输入。工具、执行和总结预算由 Host 实施。
+执行只通过 `AuthorizeExecution`，要求审批域确认消费后返回的 `ExecutionPermit`；流程确认后通过 `RecoveryEffect::Execute` 交付许可。调用方持续保证目标所有权和当前故障条件，`TargetAuthority` 不是分布式锁。观察、验收和核实证据接受最多 30 秒的新鲜度窗口；时间由可信调用方显式输入。工具、执行和总结预算由调用方实施。
 
 ## 恢复与核实
 
@@ -31,6 +31,6 @@
 
 ## 独立经验任务
 
-业务结果提交同时创建稳定 `ExperienceJob` 并保留完整任务审计快照；失败或 Unknown 的实际动作先写入流程本地隔离，不依赖知识模块可用。`pending_experiences()` 返回未交付任务，`BeginExperience` 确认后产生只读总结效果。`ExperienceSummarized` 保存总结及可选候选，候选来源绑定总结 Harness 与 call ID；`ExperienceFailed` 保留重试状态。`ExperienceJob.record()` 使用与检索相同的稳定条件构造规则，并把实际执行轨迹放入经验 `actions`；完整观察仍留在任务快照，候选不继承业务成功作为执行或验收事实。Host 持久保存经验后提交 `ExperienceDelivered`；重试不重新执行修复。
+业务结果提交同时创建稳定 `ExperienceJob` 并保留完整任务审计快照；失败或 Unknown 的实际动作先写入流程本地隔离，不依赖知识模块可用。`pending_experiences()` 返回未交付任务，`BeginExperience` 确认后产生只读总结效果。`ExperienceSummarized` 保存总结及可选候选，候选来源绑定总结 Harness 与 call ID；`ExperienceFailed` 保留重试状态。`ExperienceJob.record()` 使用与检索相同的稳定条件构造规则，并把实际执行轨迹放入经验 `actions`；完整观察仍留在任务快照，候选不继承业务成功作为执行或验收事实。调用方持久保存经验后提交 `ExperienceDelivered`；重试不重新执行修复。
 
 完整流程见[恢复参考](../../../../docs/recovery.md)，提交与历史义务见[领域维护](../../../../docs/domain-maintenance.md)，开发规则见[AGENTS](AGENTS.md)。

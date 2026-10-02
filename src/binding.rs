@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) fn digest(value: &impl Serialize) -> String {
     // Private callers provide serializable domain data with string-keyed maps.
-    // Sort recursively even when a Host enables serde_json's preserve_order.
+    // Sort recursively even when a caller enables serde_json's preserve_order.
     let mut value = serde_json::to_value(value).expect("serializable domain binding");
     value.sort_all_objects();
     let mut hash = Sha256::new();

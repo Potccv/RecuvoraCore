@@ -1,4 +1,4 @@
-//! Host transaction proposals and strictly validated event restoration.
+//! Pure transaction proposals and strictly validated event restoration.
 use super::*;
 
 impl IncidentLedger {
@@ -45,7 +45,7 @@ impl IncidentLedger {
         Ok(ledger)
     }
 
-    /// Returns None for an exact retry of the latest monitor commit. The Host
+    /// Returns None for an exact retry of the latest monitor commit. The caller
     /// must ensure this aggregate is current before acknowledging that retry.
     pub fn prepare_monitor(
         &self,
