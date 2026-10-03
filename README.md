@@ -1,27 +1,29 @@
-# Recuvora Core
+# RecuvoraCore
 
-`recuvora-core` 是恢复领域的纯逻辑 Rust 库，匹配修复经验、生成统一 Harness 修复请求，并校验动作、执行结果、独立业务验收及经验总结。所有计算以显式传入的事实、政策、时间与证据为依据，返回待提交变更；本库不执行外部操作。
+RecuvoraCore 是无状态 Rust 业务计算库，包名 `recuvora-core`，版本 0.2.0。它从故障和经验生成有界修复请求，再从明确结果和总结构造修复经验。
+
+## 功能
+
+- 按稳定条件和关键词精确匹配经验，保留成功、失败和 Unknown 的结果标签。
+- 已知与未知故障统一生成 `HarnessRepairRequest`，提供完整命中数与最多四条预算内经验；要求总结经验并评估脚本化。
+- 根据显式结果、实际动作、证据和总结生成 `RepairExperience`，候选脚本与实际动作分开表达。
+
+公开顶层模块只有 [operation](src/operation.rs) 与 [recovery](src/recovery/README.md)。库中没有审批、执行许可、故障台账、任务状态机、提交回执或重试队列；调用结果只是业务数据。
+
+## 使用
+
+通过 Rust 库依赖调用 `recovery::planning::prepare_repair`、`recovery::knowledge::matching_experiences` 和 `recovery::build_experience`。输入由调用方提供；本库不读取文件、访问网络、读取系统时间或执行动作。前提与示例见[调用契约](docs/calling-contract.md)。
 
 ## 阅读约定
 
-- **恢复流程**：故障登记、经验匹配、受授权的 Harness 修复、独立业务验收及经验总结交付的领域状态机，由 `RecoveryState` 计算。
-- **Harness**：参与修复或总结的 AI 能力逻辑身份；Core 生成请求并校验委托与返回证据，不包含服务接入实现。
-- **记录版本号（revision）**：每次提交的版本。调用方原子比较预期版本并持久提交，过期输入不能覆盖新事实。
-- **待提交变更**：`Prepared` 中的候选状态和提交请求；调用方确认提交后才安装状态并取得后续操作意图。
-- **未知执行结果（Unknown）**：不能确定执行或业务恢复结论；独立核实证据之前不得重放动作。
-- **修复经验**：带结果、证据、实际动作与总结的 `RepairExperience`；可选脚本化候选不继承业务成功作为执行或验收事实。
-- **动作产物**：`RepairArtifact` 保存动作种类、JSON 载荷、前提、版本和生成来源。Core 校验领域绑定，具体能力解释由调用方负责。
+- **故障**：待处理的目标问题及稳定适用条件。
+- **经验**：包含结果、实际动作、证据和总结的参考记录，不代表执行权限。
+- **Harness**：接收修复或总结请求的外部能力；本库只构造数据。
+- **脚本化评估**：可脚本化、不适合或无法判断；候选产物不是已验证的修复。
+- `target`、`workload`、`provider observation`、`external action` 表示中立业务对象，不绑定具体供应商。
 
-## 使用方式
+## 导航
 
-本项目保持单个库包，公开顶层模块只有 `operation` 与 `recovery`，没有应用入口、文件存储、网络客户端、系统时钟或异步运行时。主要入口为 `ApprovalLedger`、`IncidentLedger`、`KnowledgeState` 和 `RecoveryState`，见[源码导航](src/README.md)。
+[架构](docs/architecture.md) · [业务参考](docs/recovery.md) · [源码](src/README.md) · [文档](docs/README.md) · [开发](docs/development.md) · [测试](tests/README.md) · [实现状态](docs/implementation-status.md)
 
-调用方加载完整已提交领域历史，调用 Core 准备变更，以提交请求中的预期版本执行原子持久提交，再用 `CommitReceipt` 确认并安装新状态。提交回执是可信调用方的断言，不能由模型或界面构造；具体边界见[架构](docs/architecture.md)。
-
-恢复配置使用 `schema_version = 2`，只支持当前协议。`RecoveryCommand::StartRepair` 为有经验和无经验的故障生成同一种请求，经验总结和脚本化评估独立于业务终态。使用前提见[调用契约](docs/calling-contract.md)，详细行为见[恢复流程](docs/recovery.md)。
-
-## 能力与验证
-
-Core 保留硬政策、审核身份和期限、一次执行许可、同目标互斥、Unknown 核实、精确经验检索及永久动作版本隔离。历史重放不返回执行许可或外部操作；经验总结与交付失败不重跑修复。当前验证与边界见[实现状态](docs/implementation-status.md)。
-
-开发遵循 [AGENTS](AGENTS.md) 和[开发指南](docs/development.md)。完整入口见[文档导航](docs/README.md)。
+修改前阅读 [AGENTS](AGENTS.md)。构建与测试输出放源码外，检查入口见 [scripts](scripts/README.md)。

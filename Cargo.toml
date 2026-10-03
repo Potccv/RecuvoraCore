@@ -3,7 +3,7 @@ name = "recuvora-core"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
-description = "Pure recovery policy, approval and knowledge decisions for Recuvora"
+description = "Stateless experience matching and repair computation for Recuvora"
 publish = false
 autobins = false
 autotests = false
@@ -13,31 +13,13 @@ name = "recuvora_core"
 path = "src/lib.rs"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive", "rc"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-im = { version = "15.1", features = ["serde"] }
-sha2 = "0.10"
 
 [lints.rust]
 unsafe_code = "forbid"
 
 [[test]]
-name = "incidents"
-path = "tests/incidents.rs"
-
-[[test]]
-name = "approval"
-path = "tests/approval.rs"
-
-[[test]]
-name = "knowledge"
-path = "tests/knowledge.rs"
-
-[[test]]
-name = "recovery"
-path = "tests/recovery.rs"
-
-[[test]]
-name = "commit"
-path = "tests/commit.rs"
+name = "business"
+path = "tests/business.rs"

@@ -1,11 +1,10 @@
-//! Pure repair experience decisions. Artifacts and reports never grant permits.
+//! Applicable experiences are reference material, including failed and unknown outcomes.
 mod contract;
-mod query;
-mod state;
-mod validation;
-
-pub use contract::*;
-pub use state::KnowledgeState;
-
 mod experience;
+mod query;
+pub(crate) mod validation;
+use super::BusinessError;
+pub use crate::operation::{MAX_ARTIFACT_BYTES, RepairArtifact};
+pub use contract::*;
 pub use experience::*;
+pub use query::matching_experiences;
