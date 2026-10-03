@@ -8,3 +8,5 @@
 - [实现状态](implementation-status.md)：实际验证范围与限制。
 
 文档规范见 [AGENTS](AGENTS.md)，项目入口见 [README](../README.md)。
+
+- [恢复流程](workflow.md)：审批、执行、验收、原子提交和独立经验。

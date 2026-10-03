@@ -22,3 +22,6 @@ impl RepairArtifact {
         crate::recovery::knowledge::validation::artifact(self)
     }
 }
+
+mod commit;
+pub use commit::*;

@@ -1,7 +1,5 @@
-# 经验模型与匹配
+# 修复经验
 
-`RepairExperience` 保存结果、适用条件、实际动作、证据与 `ExperienceReport`；`Scriptability` 表达可脚本化、不适合或无法判断。
+`contract.rs` 定义经验、查询与配置；`query.rs` 精确匹配并稳定排序；`managed.rs` 提供可信经验断言与管理查询；`state.rs` 校验不可变动作版本、幂等记录和失败/Unknown 隔离。`validation.rs` 检查中立数据形状。模型报告只提供总结及脚本化判断，候选不继承业务验收。完整恢复通过 RecoverySession 原子交付，独立 KnowledgeState 仍支持明确容量扩展。
 
-`matching_experiences` 返回稳定排序的借用引用，不维护知识状态、可信断言、隔离表或存储。`KnowledgeQuery.limit` 的形状检查不截断底层匹配；完整算法见[业务参考](../../../docs/recovery.md#经验匹配)。
-
-中立动作类型统一来自 [operation](../../operation.rs)，详细调用前提见[调用契约](../../../docs/calling-contract.md)。
+流程见[恢复参考](../../../docs/workflow.md)，提交前提见[调用契约](../../../docs/calling-contract.md)，开发规则见[AGENTS](AGENTS.md)。

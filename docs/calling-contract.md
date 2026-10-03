@@ -1,31 +1,39 @@
 # 调用契约
 
-Core 接受普通业务数据并返回普通业务数据。调用方负责数据来源、当前有效性、授权、状态管理和结果保存。JSON 可反序列化为请求或经验，不会获得任何许可。
+`RecoveryPlatform` 是可信能力接口，`RecoveryEngine` 决定业务调用顺序。实现方提供配置、显式时间、取消状态、已确认状态读取，以及 inspect、review、execute、verify、summarize 和提交能力。
 
-## 入口示例
+## 聚合提交
+
+1. `commit` 使用当前 `RecoverySession::prepare(id, command, now_ms)` 生成提案。
+2. 原子核对 `CommitRequest.expected_revision`，保存请求和 `pending.state().latest_entry()` 的完整条目。
+3. 可靠持久提交后构造 `CommitReceipt::confirmed`，调用 `pending.confirm`。
+4. 安装确认后的状态，向引擎返回效果。写入未知时不得安装或重试派发，应读取受保护的已提交历史恢复。
+
+提交绑定完整命令、配置、时间、先前历史摘要与全部子域变化。效果在确认前不可取得；许可不可复制、不可反序列化。提交回执是可信调用方的声明，不是认证机制。
+
+`RecoverySession::restore` 校验有序完整历史，不返回执行效果；恢复后先提交 `SessionCommand::Recover`。原操作和期限不变，中断执行进入 Unknown，等待审批进入 Paused。具体规则见[恢复流程](workflow.md)。历史摘要不防止可信存储整体被替换或删改后重算，来源保护属于调用方。
+
+## 外部能力
+
+- `acquire_execution` 必须获取当前故障及目标所有权保护，并保持到释放；逻辑 `TargetAuthority` 本身不是锁。
+- `execute` 必须在实际外部发送前复核保护及 `validate_dispatch`，无自动执行重试；具体动作经 `PrepareAction` 提案确认后才派发。
+- `release_execution` 应幂等。调用取消或 future 结束不证明远端执行者停止；实现方监督并排空原调用，无法证明完成则返回 Unknown。
+- 审核身份来自可信能力绑定；模型只给出建议。验收独立于修复模型，证据绑定原操作、目标、验证规则和时间。
+- 逻辑状态读取与提交必须使用同一聚合。多个驱动不得并发推进同一任务；物理锁和版本比较由实现方提供。
+- 能力错误转换为 `EngineError::Port`；冲突、忙碌、停止与容量错误保留结构化分类。
+
+## 独立计算示例
 
 ```rust
 use recuvora_core::recovery::knowledge::{KnowledgeQuery, matching_experiences};
 use std::collections::BTreeMap;
-
 let query = KnowledgeQuery {
     conditions: BTreeMap::from([("fault_fingerprint".into(), "unhealthy".into())]),
     keywords: vec![],
     limit: 4,
 };
-let matches = matching_experiences(&query, [])?;
-assert!(matches.is_empty());
+assert!(matching_experiences(&query, [])?.is_empty());
 # Ok::<(), recuvora_core::recovery::BusinessError>(())
 ```
 
-修复请求使用 `planning::RepairRequestInput` 和经验引用迭代器调用 `prepare_repair`。输入中的 `ProblemContext` 提供故障，`TargetObservation` 提供完整观察，`TargetBinding` 和委托字段描述调用方选定的约束。算法和完整预算见[业务参考](recovery.md)。
-
-## 输入和结果
-
-- 调用方管理经验唯一身份和可信来源，避免同一身份出现矛盾内容。
-- 观察时间只是数据，Core 不读取当前时间或判定时效；条件匹配也不证明外部目标当前仍符合条件。
-- `build_experience` 接收明确业务结果和实际动作。模型报告只提供总结与脚本化建议，不能替代真实结果。
-- `RepairArtifact::validate`、`ExperienceReport::validate`、`ProblemContext::validate` 与 `KnowledgeQuery::validate` 仅检查中立数据形状和大小，不检查权限、执行环境或来源。
-- `BusinessError::Invalid` 表示内容或预算不满足契约，`Capacity` 表示稳定事实数量超限；没有提交、重放或网络错误类型。
-
-本库不提供状态安装、提交确认、历史重放、执行许可或交付队列接口。
+`prepare_repair`、`matching_experiences`、`build_experience` 的单独调用只产生业务数据，不替代聚合的授权、验收和提交。

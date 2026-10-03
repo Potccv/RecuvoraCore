@@ -8,3 +8,8 @@ pub use crate::operation::{MAX_ARTIFACT_BYTES, RepairArtifact};
 pub use contract::*;
 pub use experience::*;
 pub use query::matching_experiences;
+
+mod managed;
+mod state;
+pub use managed::TrustedRepairExperience;
+pub use state::KnowledgeState;

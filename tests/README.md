@@ -1,7 +1,12 @@
-# 测试导航
+# 集中测试
 
-[business.rs](business.rs) 验证精确匹配、稳定排序、完整命中数、已知与未知统一请求、整条预算选择、UTF-8/JSON 临界预算、稳定条件冲突和容量、经验结果与脚本化报告分离及计算可重复性。
+| 目标 | 范围 |
+| --- | --- |
+| business | 稳定条件、精确匹配、请求预算和经验构造 |
+| approval | 硬政策、身份、期限、一次许可和审批恢复 |
+| commit | 完整请求绑定与确认门 |
+| knowledge | 幂等经验、不可变产物、隔离和重放 |
+| recovery | 任务迁移、执行证据、验收、预算和总结状态 |
+| engine | 注入能力调用顺序、人工等待、聚合原子性、完整审核上下文绑定、恢复和独立重试 |
 
-[windows_check.rs](windows_check.rs) 与 [windows_check_cargo.rs](windows_check_cargo.rs) 由开发脚本直接编译运行，验证路径与子进程环境保护。Cargo 目标以 [manifest](../Cargo.toml) 为准。
-
-检查命令见[scripts](../scripts/README.md)。测试只证明本库计算和开发工具行为，不证明真实外部执行。约束见 [AGENTS](AGENTS.md)。
+测试使用内存状态和显式时间，不证明调用方物理持久化、分布式互斥、真实执行器或业务恢复。检查入口见[scripts](../scripts/README.md)，实际结果见[实现状态](../docs/implementation-status.md)。

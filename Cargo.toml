@@ -3,7 +3,7 @@ name = "recuvora-core"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
-description = "Stateless experience matching and repair computation for Recuvora"
+description = "Recovery business engine and commit-gated domain decisions for Recuvora"
 publish = false
 autobins = false
 autotests = false
@@ -13,7 +13,9 @@ name = "recuvora_core"
 path = "src/lib.rs"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
+im = { version = "15.1", features = ["serde"] }
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 thiserror = "2.0"
 
@@ -23,3 +25,23 @@ unsafe_code = "forbid"
 [[test]]
 name = "business"
 path = "tests/business.rs"
+
+[[test]]
+name = "approval"
+path = "tests/approval.rs"
+
+[[test]]
+name = "commit"
+path = "tests/commit.rs"
+
+[[test]]
+name = "knowledge"
+path = "tests/knowledge.rs"
+
+[[test]]
+name = "recovery"
+path = "tests/recovery.rs"
+
+[[test]]
+name = "engine"
+path = "tests/engine.rs"

@@ -71,3 +71,10 @@ pub(crate) fn query(value: &KnowledgeQuery) -> Result<(), BusinessError> {
     }
     Ok(())
 }
+
+pub(crate) fn evidence(values: &[String]) -> Result<(), BusinessError> {
+    if values.is_empty() {
+        return Err(BusinessError::Invalid("evidence required".into()));
+    }
+    strings(values, 32, 1024, "evidence")
+}
