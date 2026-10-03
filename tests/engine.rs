@@ -453,8 +453,9 @@ fn receipt_acknowledgement_can_advance_evidence_revision_before_initial_registra
         (report.incident_revision, false, true, true),
         (report.incident_revision + 1, false, true, true),
         (report.incident_revision - 1, false, true, false),
-        (report.incident_revision + 1, true, false, false),
-        (report.incident_revision + 1, true, true, false),
+        (report.incident_revision + 1, true, false, true),
+        (report.incident_revision + 1, true, true, true),
+        (report.incident_revision + 1, false, false, true),
     ] {
         let platform = Platform::new(true);
         let evidence = IncidentEvidence {
@@ -506,78 +507,127 @@ fn receipt_acknowledgement_can_advance_evidence_revision_before_initial_registra
 }
 
 #[test]
-fn received_and_active_evidence_cannot_be_substituted_at_intake_authorization_or_send() {
-    for report in [problem("incident"), error_report()] {
-        for (active, received) in [
-            (true, true),
-            (false, false),
-            (
-                report.origin == ProblemOrigin::ErrorLog,
-                report.origin == ProblemOrigin::Incident,
-            ),
-        ] {
+fn legacy_liveness_flags_do_not_gate_matching_intake_authorization_or_dispatch() {
+    for report in [problem("next-incident"), error_report()] {
+        for (active, received) in [(true, true), (false, false), (true, false), (false, true)] {
             let platform = Platform::new(true);
+            let previous = platform.start_approved();
+            assert_eq!(
+                run(RecoveryEngine::advance(&platform, &previous))
+                    .unwrap()
+                    .stage,
+                RecoveryStage::Completed
+            );
             let mut proof = intake_evidence(&report);
             proof.active = active;
             proof.received = received;
+            for invalid_identity in [true, false] {
+                let mut invalid = proof.clone();
+                if invalid_identity {
+                    invalid.incident_id = "wrong-report".into();
+                } else {
+                    invalid.revision = 0;
+                }
+                assert!(
+                    platform
+                        .commit(SessionCommand::Register {
+                            problem: report.clone(),
+                            incident: invalid,
+                        })
+                        .is_err()
+                );
+            }
+            platform
+                .commit(SessionCommand::Register {
+                    problem: report.clone(),
+                    incident: proof.clone(),
+                })
+                .unwrap();
+            let id = platform
+                .memory
+                .lock()
+                .unwrap()
+                .session
+                .tasks()
+                .find(|task| task.problem.incident_id == report.incident_id)
+                .unwrap()
+                .id
+                .clone();
+            let task = run(RecoveryEngine::advance(&platform, &id)).unwrap();
+            assert_eq!(task.stage, RecoveryStage::AwaitingApproval);
+            let request = &task.operation.as_ref().unwrap().action["request"];
+            assert_eq!(request["matched_experience_count"], 1);
+            assert_eq!(request["experiences"].as_array().unwrap().len(), 1);
+            assert_eq!(request["problem"], serde_json::to_value(&report).unwrap());
+            let authorize = |task: &RecoveryTask, incident| SessionCommand::Authorize {
+                task_id: id.clone(),
+                revision: task.revision,
+                observation: observation(),
+                incident,
+                authority: TargetAuthority {
+                    target_id: task.problem.target_id.clone(),
+                    epoch: "owner".into(),
+                },
+            };
+            assert!(platform.commit(authorize(&task, proof.clone())).is_err());
+            let approval = platform.approval(&id).unwrap().unwrap();
+            platform
+                .commit(SessionCommand::HumanDecision {
+                    task_id: id.clone(),
+                    revision: approval.revision,
+                    decision: ApprovalDecision::Approve,
+                    actor: "operator".into(),
+                    reason: "scoped".into(),
+                })
+                .unwrap();
+            let task = platform.task(&id).unwrap();
+            let mut wrong_identity = proof.clone();
+            wrong_identity.incident_id = "wrong-report".into();
+            let mut stale_revision = proof.clone();
+            stale_revision.revision = 0;
+            for invalid in [&wrong_identity, &stale_revision] {
+                assert!(platform.commit(authorize(&task, invalid.clone())).is_err());
+                assert_eq!(
+                    platform.approval(&id).unwrap().unwrap().state,
+                    ApprovalState::Approved
+                );
+            }
+            platform.commit(authorize(&task, proof.clone())).unwrap();
+            let memory = platform.memory.lock().unwrap();
+            for (send_active, send_received) in
+                [(true, true), (false, false), (true, false), (false, true)]
+            {
+                let send = IncidentEvidence {
+                    active: send_active,
+                    received: send_received,
+                    ..proof.clone()
+                };
+                assert!(
+                    memory
+                        .session
+                        .validate_dispatch(&id, &send, platform.now)
+                        .is_ok()
+                );
+            }
+            for invalid in [&wrong_identity, &stale_revision] {
+                assert!(
+                    memory
+                        .session
+                        .validate_dispatch(&id, invalid, platform.now)
+                        .is_err()
+                );
+            }
             assert!(
-                platform
-                    .commit(SessionCommand::Register {
-                        problem: report.clone(),
-                        incident: proof,
-                    })
+                memory
+                    .session
+                    .validate_dispatch(&id, &proof, approval.request.expires_at * 1000)
                     .is_err()
             );
-            assert_eq!(platform.memory.lock().unwrap().session.tasks().count(), 0);
+            let restored =
+                RecoverySession::restore(memory.session.config().clone(), &memory.entries).unwrap();
+            assert_eq!(restored.task(&id).unwrap().problem, report);
         }
     }
-    let platform = Platform::new(true);
-    let id = register_report(&platform);
-    run(RecoveryEngine::advance(&platform, &id)).unwrap();
-    let approval = platform.approval(&id).unwrap().unwrap();
-    platform
-        .commit(SessionCommand::HumanDecision {
-            task_id: id.clone(),
-            revision: approval.revision,
-            decision: ApprovalDecision::Approve,
-            actor: "operator".into(),
-            reason: "scoped".into(),
-        })
-        .unwrap();
-    let task = platform.task(&id).unwrap();
-    let valid = intake_evidence(&task.problem);
-    let mut wrong = valid.clone();
-    wrong.active = true;
-    wrong.received = false;
-    let authorize = |incident| SessionCommand::Authorize {
-        task_id: id.clone(),
-        revision: task.revision,
-        observation: observation(),
-        incident,
-        authority: TargetAuthority {
-            target_id: task.problem.target_id.clone(),
-            epoch: "owner".into(),
-        },
-    };
-    assert!(platform.commit(authorize(wrong.clone())).is_err());
-    assert_eq!(
-        platform.approval(&id).unwrap().unwrap().state,
-        ApprovalState::Approved
-    );
-    platform.commit(authorize(valid.clone())).unwrap();
-    let memory = platform.memory.lock().unwrap();
-    assert!(
-        memory
-            .session
-            .validate_dispatch(&id, &valid, platform.now)
-            .is_ok()
-    );
-    assert!(
-        memory
-            .session
-            .validate_dispatch(&id, &wrong, platform.now)
-            .is_err()
-    );
 }
 
 #[test]
@@ -620,13 +670,36 @@ fn received_error_identity_binds_body_and_source_without_replacing_unknown_work(
     run(RecoveryEngine::advance(&platform, &id)).unwrap();
     let mut next = original;
     next.incident_id = "next-error".into();
-    assert!(matches!(
-        platform.commit(SessionCommand::Register {
-            incident: intake_evidence(&next),
-            problem: next,
-        }),
-        Err(EngineError::Recovery(RecoveryError::Busy))
-    ));
+    for (active, received) in [(true, true), (false, false), (true, false), (false, true)] {
+        assert!(matches!(
+            platform.commit(SessionCommand::Register {
+                incident: IncidentEvidence {
+                    active,
+                    received,
+                    ..intake_evidence(&next)
+                },
+                problem: next.clone(),
+            }),
+            Err(EngineError::Recovery(RecoveryError::Busy))
+        ));
+        assert!(
+            platform
+                .memory
+                .lock()
+                .unwrap()
+                .session
+                .validate_dispatch(
+                    &id,
+                    &IncidentEvidence {
+                        active,
+                        received,
+                        ..intake_evidence(&error_report())
+                    },
+                    platform.now
+                )
+                .is_err()
+        );
+    }
     let memory = platform.memory.lock().unwrap();
     assert_eq!(
         memory
@@ -650,12 +723,27 @@ fn incident_defaults_do_not_change_existing_serialized_intake_bindings() {
         ProblemOrigin::Incident
     );
     let proof = serde_json::to_value(incident()).unwrap();
+    assert_eq!(proof["active"], true);
     assert!(proof.get("received").is_none());
     assert!(
         !serde_json::from_value::<IncidentEvidence>(proof)
             .unwrap()
             .received
     );
+    let omitted = serde_json::from_value::<IncidentEvidence>(serde_json::json!({
+        "incident_id": "incident", "revision": 1
+    }))
+    .unwrap();
+    assert!(!omitted.active && !omitted.received);
+    for encoded in [
+        r#"{"incident_id":"incident","revision":1,"active":true}"#,
+        r#"{"incident_id":"incident","revision":1,"active":false}"#,
+        r#"{"incident_id":"incident","revision":1,"active":true,"received":true}"#,
+        r#"{"incident_id":"incident","revision":1,"active":false,"received":true}"#,
+    ] {
+        let decoded: IncidentEvidence = serde_json::from_str(encoded).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+    }
 }
 #[test]
 fn engine_owns_review_execution_verification_and_summary_sequence() {

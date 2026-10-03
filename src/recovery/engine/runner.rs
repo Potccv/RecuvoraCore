@@ -20,7 +20,7 @@ pub trait RecoveryPlatform: Send + Sync {
     fn commit(&self, command: SessionCommand) -> EngineResult<Vec<SessionEffect>>;
     fn inspect(&self, timeout_secs: u64) -> CapabilityFuture<'_, TargetObservation>;
     fn review(&self, input: ReviewInput, timeout_secs: u64) -> CapabilityFuture<'_, ReviewOutput>;
-    /// Retain current-fault and target-ownership protection until release_execution.
+    /// Retain intake-identity and target-ownership protection until release_execution.
     fn acquire_execution<'a>(
         &'a self,
         task: &'a RecoveryTask,

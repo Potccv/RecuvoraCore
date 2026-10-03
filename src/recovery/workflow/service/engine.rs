@@ -12,28 +12,22 @@ pub struct TargetAuthority {
     pub epoch: String,
 }
 
-/// Trusted intake evidence. An Incident requires current active facts; an ErrorLog
-/// requires a protected immutable receipt. Receipt alone does not assert health.
+/// Trusted intake identity and revision, without an error-liveness decision.
 /// The caller must retain the matching identity/revision gate through dispatch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IncidentEvidence {
     pub incident_id: String,
     pub revision: u64,
+    /// Historical binding compatibility only; never used for business decisions.
+    #[serde(default)]
     pub active: bool,
+    /// Historical binding compatibility only; never used for business decisions.
     #[serde(default, skip_serializing_if = "not_received")]
     pub received: bool,
 }
 fn not_received(value: &bool) -> bool {
     !value
-}
-impl IncidentEvidence {
-    pub(crate) fn supports(&self, origin: ProblemOrigin) -> bool {
-        match origin {
-            ProblemOrigin::Incident => self.active && !self.received,
-            ProblemOrigin::ErrorLog => self.received && !self.active,
-        }
-    }
 }
 
 /// Committed history data. Loading it never dispatches an external operation.
@@ -843,7 +837,6 @@ impl RecoveryState {
                         ProblemOrigin::Incident => incident.revision != problem.incident_revision,
                         ProblemOrigin::ErrorLog => incident.revision < problem.incident_revision,
                     }
-                    || !incident.supports(problem.origin)
                 {
                     return Err(invalid(
                         "matching incident or error report evidence required",
@@ -955,9 +948,10 @@ impl RecoveryState {
                     || !crate::identity::valid_id(&authority.epoch)
                     || incident.incident_id != task.problem.incident_id
                     || incident.revision < task.problem.incident_revision
-                    || !incident.supports(task.problem.origin)
                 {
-                    return Err(invalid("current incident and target ownership required"));
+                    return Err(invalid(
+                        "matching intake identity and target ownership required",
+                    ));
                 }
                 self.observe(observation, now)?;
                 self.conditions(&task, observation)?;

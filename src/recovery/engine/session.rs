@@ -246,7 +246,6 @@ impl RecoverySession {
             || now / 1000 >= approval.request.expires_at
             || incident.incident_id != task.problem.incident_id
             || incident.revision < task.problem.incident_revision
-            || !incident.supports(task.problem.origin)
         {
             return Err(EngineError::Conflict);
         }

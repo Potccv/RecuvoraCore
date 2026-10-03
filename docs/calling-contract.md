@@ -15,7 +15,8 @@
 
 ## 外部能力
 
-- `acquire_execution` 必须按 `ProblemContext.origin` 获取当前故障或不可变错误报告收件保护，并同时持有目标所有权至释放；逻辑 `TargetAuthority` 本身不是锁。错误报告收件只证明记录身份、原文和来源绑定有效，不证明当前健康，证据形状见[恢复流程](workflow.md)。
+- `acquire_execution` 必须获取记录身份、revision 及不可变错误报告内容的保护，并同时持有目标所有权至释放；逻辑 `TargetAuthority` 本身不是锁。Core 不要求再次判断日志是否活跃，兼容字段不参与业务决策，证据形状见[恢复流程](workflow.md)。
+- `inspect` 采集修复和审批所需的目标条件，不能将其实现为错误日志活跃性门槛；错误识别与实时性由提供方保证。
 - `execute` 必须在实际外部发送前复核保护及 `validate_dispatch`，无自动执行重试；具体动作经 `PrepareAction` 提案确认后才派发。
 - `release_execution` 应幂等。调用取消或 future 结束不证明远端执行者停止；实现方监督并排空原调用，无法证明完成则返回 Unknown。
 - 审核身份来自可信能力绑定；模型只给出建议。验收独立于修复模型，证据绑定原操作、目标、验证规则和时间。

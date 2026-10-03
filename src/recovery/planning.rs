@@ -28,7 +28,7 @@ pub struct TargetBinding {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProblemContext {
-    /// Describes the factual intake contract, never execution permission.
+    /// Selects the input data shape, never error liveness or execution permission.
     #[serde(default, skip_serializing_if = "ProblemOrigin::is_incident")]
     pub origin: ProblemOrigin,
     /// Original bounded report evidence; the raw log text remains in summary.
@@ -51,7 +51,7 @@ pub struct ProblemContext {
 pub enum ProblemOrigin {
     #[default]
     Incident,
-    /// An immutable received error report, not a claim of current target health.
+    /// An immutable error report whose liveness is not evaluated by Core.
     ErrorLog,
 }
 impl ProblemOrigin {
@@ -61,8 +61,8 @@ impl ProblemOrigin {
 }
 
 /// Descriptive source identity and original payload, never a provider route or
-/// current-health assertion. Relative age is retained as reported, not compared
-/// with the caller's clock or used to discard historical reports.
+/// execution permission. Relative age is retained as reported, not compared
+/// with the caller's clock or used for error-liveness decisions.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorLogEvidence {

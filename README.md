@@ -1,6 +1,6 @@
 # RecuvoraCore
 
-RecuvoraCore 是恢复业务引擎，包名 `recuvora-core`，版本 0.2.0。它接收故障、匹配经验、推进审批与 Harness 修复、判定独立验收结果，并生成和交付修复经验。
+RecuvoraCore 是恢复业务引擎，包名 `recuvora-core`，版本 0.2.0。它接收故障及错误报告，不判断日志是否活跃，直接匹配经验、推进审批与 Harness 修复、判定独立验收结果，并生成和交付修复经验。
 
 ## 功能
 

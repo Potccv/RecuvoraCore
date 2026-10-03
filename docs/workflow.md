@@ -2,11 +2,13 @@
 
 ## 从故障到修复
 
-`SessionCommand::Register` 接收 `ProblemContext` 与匹配来源的可信证据。默认 `origin: incident` 要求 `IncidentEvidence.active = true` 且 `received = false`；`origin: error_log` 要求 `active = false` 且 `received = true`，表示调用方已可靠接收不可变错误报告，不声称目标当前不健康。两类证据不能互相替代，身份和 revision 均须绑定本次问题。
+`SessionCommand::Register` 接收 `ProblemContext` 与绑定记录身份和 revision 的 `IncidentEvidence`。提供方保证错误识别及实时性，Core 不判断日志是否活跃，受理后进入经验匹配等恢复流程。`origin: incident` 与 `origin: error_log` 只区分输入数据形状和完整报告要求。
 
-错误报告原文完整放在 `summary`，最多 8192 UTF-8 字节，不截断；`report` 必须保留 `source_id`、`generation`、`record_id`、正整数 `sequence`、原始 `age_ms` 及最多 4096 字节、嵌套深度最多 24 的对象 `evidence`。这些均为描述性证据，不是提供方路由或执行权限。错误报告可以是历史日志，其年龄不构成拒收或业务健康结论。普通故障的 `report` 必须为空。
+`IncidentEvidence.active` 和 `received` 仅保留既有持久历史的序列化绑定，不参与受理、授权或实际发送决策。两字段输入均可省略并默认为 `false`；序列化保持 `active` 总是输出、`received = false` 时省略，避免改写已有绑定。
 
-按故障身份去重；错误报告重复身份必须与完整已保存 `ProblemContext` 一致，不能借重送更换原文、来源或证据。首次受理错误报告允许收件证据 revision 大于或等于问题原始 revision，以接纳期间发生的人工确认；当前故障首次受理仍要求严格相等。同目标存在非终态或 Unknown 时拒绝新任务，调用方须保留尚未受理的报告。`RecoveryEngine::advance` 仍获取当前观察，调用统一规划函数匹配经验并准备有界 Harness 委托；收到报告本身不产生执行、验收或完成事实。
+错误报告原文完整放在 `summary`，最多 8192 UTF-8 字节，不截断；`report` 必须保留 `source_id`、`generation`、`record_id`、正整数 `sequence`、原始 `age_ms` 及最多 4096 字节、嵌套深度最多 24 的对象 `evidence`。这些均为描述性证据，不是提供方路由或执行权限；`age_ms` 只按输入保存，不用于时效或活跃性判断。普通故障的 `report` 必须为空。
+
+按故障身份去重；错误报告重复身份必须与完整已保存 `ProblemContext` 一致，不能借重送更换原文、来源或证据。首次受理错误报告允许收件证据 revision 大于或等于问题原始 revision，以接纳期间发生的人工确认；普通故障首次受理仍要求严格相等。同目标存在非终态或 Unknown 时拒绝新任务，调用方须保留尚未受理的报告。`RecoveryEngine::advance` 通过 `inspect` 采集目标条件，调用统一规划函数匹配经验并准备有界 Harness 委托；目标条件采集不重新判定错误日志，收到报告本身不产生执行、验收或完成事实。
 
 `Start` 在一次提案中保存操作、创建审批并关联任务，进入 `AwaitingApproval`。政策必须允许 `repair_with_harness`，具体动作仍受目标允许范围限制。经验仅供参考，已知和未知故障都需要审批。
 
@@ -16,7 +18,7 @@
 
 审核支持 `Human`、`Harness` 和 `HumanThenHarness`。人工等待不重复调用观察；模型审核先提交带期限的尝试身份，再调用独立审核能力。人工决定、模型建议和升级都经过硬政策及记录版本检查。原审批期限不会因恢复或重试延长。
 
-批准后重新取得当前观察与目标保护；`Authorize` 在同一次提案中消费审批、按问题来源验证当前故障或不可变报告收件、核验观察、提交执行授权，确认后返回一次 `ExecutionPermit`。实际发送前 `validate_dispatch` 继续执行同一来源证据校验。任何业务校验失败都丢弃整个提案，审批不会单独被消费。
+批准后重新取得当前观察与目标保护；`Authorize` 在同一次提案中消费审批、绑定记录身份与 revision、核验目标条件、提交执行授权，确认后返回一次 `ExecutionPermit`。实际发送前 `validate_dispatch` 继续核验记录身份、revision、批准期限和任务执行状态。两个阶段均不检查 `active` 或 `received`。任何业务校验失败都丢弃整个提案，审批不会单独被消费。
 
 具体动作通过 `PrepareAction` 保存完整内容、来源、版本与前提，消耗原任务预算。实际发送前还需复核当前保护和产物隔离。`Executed` 统一记录审批结果和任务回执；回执不匹配原操作、实际动作轨迹或停止事实时保守归为 Unknown。
 
