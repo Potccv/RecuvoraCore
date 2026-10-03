@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 fn input() -> RepairRequestInput {
     RepairRequestInput {
         problem: ProblemContext {
+            origin: Default::default(),
+            report: None,
             incident_id: "incident".into(),
             incident_revision: 1,
             target_id: "target".into(),

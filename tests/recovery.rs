@@ -44,6 +44,8 @@ fn facts() -> BTreeMap<String, String> {
 }
 fn problem(id: &str) -> ProblemContext {
     ProblemContext {
+        origin: Default::default(),
+        report: None,
         incident_id: id.into(),
         incident_revision: 1,
         target_id: "target".into(),
@@ -113,6 +115,7 @@ impl Flow {
                 incident_id: id.into(),
                 revision: 1,
                 active: true,
+                received: false,
             },
         });
         self.id = self
@@ -254,6 +257,7 @@ impl Flow {
                 incident_id: self.task().problem.incident_id.clone(),
                 revision: 1,
                 active: true,
+                received: false,
             },
             authority: TargetAuthority {
                 target_id: "target".into(),
@@ -375,6 +379,7 @@ fn unknown_execution_blocks_new_tasks_and_never_dispatches_on_restore() {
             incident_id: "incident-2".into(),
             revision: 1,
             active: true,
+            received: false,
         },
     };
     assert!(matches!(
@@ -463,6 +468,7 @@ fn current_environment_revision_and_owned_permit_are_required() {
             incident_id: "incident-1".into(),
             revision: 1,
             active: true,
+            received: false,
         },
         authority: TargetAuthority {
             target_id: "target".into(),
@@ -704,6 +710,7 @@ fn scale_recovery_tasks_retain_incremental_history_and_explicit_recovery() {
                         incident_id: incident_id.clone(),
                         revision: 1,
                         active: true,
+                        received: false,
                     },
                 }),
                 100_000,
@@ -909,6 +916,7 @@ fn stable_conditions_match_and_record_without_dynamic_observation_facts() {
             incident_id: "stable-incident".into(),
             revision: 1,
             active: true,
+            received: false,
         },
     });
     flow.id = flow.state.tasks().next().unwrap().id.clone();
@@ -989,6 +997,7 @@ fn stable_condition_conflicts_and_reserved_fingerprint_are_rejected() {
                         incident_id: "condition-conflict".into(),
                         revision: 1,
                         active: true,
+                        received: false,
                     },
                 }),
                 100_000,
@@ -1013,6 +1022,7 @@ fn stable_condition_conflicts_and_reserved_fingerprint_are_rejected() {
                         incident_id: "reserved-fingerprint".into(),
                         revision: 1,
                         active: true,
+                        received: false,
                     },
                 }),
                 100_000,
@@ -1034,23 +1044,28 @@ fn stable_condition_conflicts_and_reserved_fingerprint_are_rejected() {
     settings.target.required_facts = (0..32)
         .map(|index| (format!("required-{index:02}"), "value".into()))
         .collect();
-    let state = RecoveryState::new(settings).unwrap();
+    assert!(RecoveryState::new(settings.clone()).is_err());
+    settings.target.required_facts.remove("required-31");
+    let state = RecoveryState::new(settings.clone()).unwrap();
+    let mut boundary = problem("condition-capacity");
+    boundary.conditions = settings.target.required_facts;
     assert!(
         state
             .prepare(
                 "condition-capacity",
                 RecoveryCommand::Event(RecoveryEvent::Register {
-                    problem: problem("condition-capacity"),
+                    problem: boundary,
                     incident: IncidentEvidence {
                         incident_id: "condition-capacity".into(),
                         revision: 1,
                         active: true,
+                        received: false,
                     },
                 }),
                 100_000,
                 &knowledge,
             )
-            .is_err()
+            .is_ok()
     );
     assert_eq!(state.tasks().count(), 0);
     assert!(state.entries().is_empty());
@@ -1169,7 +1184,8 @@ fn interrupted_harness_action_retains_exact_action_and_quarantine() {
                     incident: IncidentEvidence {
                         incident_id: "next".into(),
                         revision: 1,
-                        active: true
+                        active: true,
+                        received: false,
                     },
                 }),
                 100_000,
@@ -1481,6 +1497,7 @@ fn oversized_required_repair_context_is_rejected_without_mutation() {
             incident_id: "large-fault".into(),
             revision: 1,
             active: true,
+            received: false,
         },
     });
     flow.id = flow.state.tasks().next().unwrap().id.clone();
@@ -1558,6 +1575,7 @@ fn experience_matching_ignores_dynamic_samples_but_requires_same_stable_values()
                 incident_id: "matching-incident".into(),
                 revision: 1,
                 active: true,
+                received: false,
             },
         });
         flow.id = flow.state.tasks().next().unwrap().id.clone();

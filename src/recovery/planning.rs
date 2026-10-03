@@ -28,6 +28,12 @@ pub struct TargetBinding {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProblemContext {
+    /// Describes the factual intake contract, never execution permission.
+    #[serde(default, skip_serializing_if = "ProblemOrigin::is_incident")]
+    pub origin: ProblemOrigin,
+    /// Original bounded report evidence; the raw log text remains in summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<ErrorLogEvidence>,
     pub incident_id: String,
     pub incident_revision: u64,
     pub target_id: String,
@@ -40,8 +46,76 @@ pub struct ProblemContext {
     pub evidence_refs: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProblemOrigin {
+    #[default]
+    Incident,
+    /// An immutable received error report, not a claim of current target health.
+    ErrorLog,
+}
+impl ProblemOrigin {
+    fn is_incident(&self) -> bool {
+        *self == Self::Incident
+    }
+}
+
+/// Descriptive source identity and original payload, never a provider route or
+/// current-health assertion. Relative age is retained as reported, not compared
+/// with the caller's clock or used to discard historical reports.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorLogEvidence {
+    pub source_id: String,
+    pub generation: String,
+    pub record_id: String,
+    pub sequence: u64,
+    pub age_ms: u64,
+    pub evidence: serde_json::Value,
+}
+impl ErrorLogEvidence {
+    pub fn validate(&self) -> Result<(), BusinessError> {
+        for value in [&self.source_id, &self.generation, &self.record_id] {
+            text(value, 128)?;
+        }
+        if self.sequence == 0 || !self.evidence.is_object() {
+            return Err(invalid(
+                "error report requires sequence and evidence object",
+            ));
+        }
+        if serde_json::to_vec(&self.evidence)
+            .map_err(|_| invalid("error report evidence cannot be encoded"))?
+            .len()
+            > 4096
+        {
+            return Err(BusinessError::Capacity);
+        }
+        let mut pending = vec![(&self.evidence, 0)];
+        while let Some((value, depth)) = pending.pop() {
+            if depth > 24 {
+                return Err(invalid("error report evidence nesting exceeds 24"));
+            }
+            match value {
+                serde_json::Value::Array(values) => {
+                    pending.extend(values.iter().map(|value| (value, depth + 1)));
+                }
+                serde_json::Value::Object(values) => {
+                    pending.extend(values.values().map(|value| (value, depth + 1)));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ProblemContext {
     pub fn validate(&self) -> Result<(), BusinessError> {
+        match (self.origin, &self.report) {
+            (ProblemOrigin::Incident, None) => {}
+            (ProblemOrigin::ErrorLog, Some(report)) => report.validate()?,
+            _ => return Err(invalid("problem origin and report evidence differ")),
+        }
         for value in [&self.incident_id, &self.target_id, &self.fingerprint] {
             text(value, 128)?;
         }

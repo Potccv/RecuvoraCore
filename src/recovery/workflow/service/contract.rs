@@ -1,7 +1,9 @@
 use super::*;
 
 pub(super) use crate::recovery::planning::FAULT_FINGERPRINT_CONDITION;
-pub use crate::recovery::planning::{ProblemContext, TargetBinding, TargetObservation};
+pub use crate::recovery::planning::{
+    ErrorLogEvidence, ProblemContext, ProblemOrigin, TargetBinding, TargetObservation,
+};
 pub(super) fn stable_conditions(
     problem: &ProblemContext,
     target: &TargetBinding,
@@ -49,6 +51,7 @@ impl RecoveryConfig {
             || kinds.len() > 32
             || kinds.iter().any(|kind| !crate::identity::valid_id(kind))
             || kinds.iter().collect::<BTreeSet<_>>().len() != kinds.len()
+            || self.target.required_facts.len() > 31
             || self
                 .target
                 .required_facts

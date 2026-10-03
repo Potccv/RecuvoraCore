@@ -43,6 +43,8 @@ fn facts() -> BTreeMap<String, String> {
 }
 fn problem(id: &str) -> ProblemContext {
     ProblemContext {
+        origin: Default::default(),
+        report: None,
         incident_id: id.into(),
         incident_revision: 1,
         target_id: "target".into(),
@@ -148,6 +150,7 @@ fn incident() -> IncidentEvidence {
         incident_id: "incident".into(),
         revision: 1,
         active: true,
+        received: false,
     }
 }
 fn authorization(task: &RecoveryTask, observed: TargetObservation) -> SessionCommand {
@@ -229,12 +232,12 @@ impl RecoveryPlatform for Platform {
     }
     fn acquire_execution<'a>(
         &'a self,
-        _: &'a RecoveryTask,
+        task: &'a RecoveryTask,
     ) -> CapabilityFuture<'a, ExecutionContext> {
-        Box::pin(async {
+        Box::pin(async move {
             self.log("acquire");
             Ok(ExecutionContext {
-                incident: incident(),
+                incident: intake_evidence(&task.problem),
                 authority: TargetAuthority {
                     target_id: "target".into(),
                     epoch: "owner".into(),
@@ -301,6 +304,358 @@ impl RecoveryPlatform for Platform {
             })
         })
     }
+}
+
+fn error_report() -> ProblemContext {
+    ProblemContext {
+        origin: ProblemOrigin::ErrorLog,
+        report: Some(ErrorLogEvidence {
+            source_id: "source-a".into(),
+            generation: "generation-1".into(),
+            record_id: "record-1".into(),
+            sequence: 1,
+            age_ms: 86_400_000,
+            evidence: serde_json::json!({"exit_code": 17, "original": {"worker": "worker-42"}}),
+        }),
+        summary: "ERROR workload exited\n堆栈: worker(42)\n  caused by: timeout".into(),
+        occurrences: 1,
+        keywords: Vec::new(),
+        evidence_refs: vec!["error-source:source-a:generation-1:record-1".into()],
+        ..problem("error-record")
+    }
+}
+
+fn intake_evidence(problem: &ProblemContext) -> IncidentEvidence {
+    IncidentEvidence {
+        incident_id: problem.incident_id.clone(),
+        revision: problem.incident_revision,
+        active: problem.origin == ProblemOrigin::Incident,
+        received: problem.origin == ProblemOrigin::ErrorLog,
+    }
+}
+
+fn register_report(platform: &Platform) -> String {
+    let report = error_report();
+    platform
+        .commit(SessionCommand::Register {
+            incident: intake_evidence(&report),
+            problem: report,
+        })
+        .unwrap();
+    platform
+        .memory
+        .lock()
+        .unwrap()
+        .session
+        .tasks()
+        .find(|task| task.problem.origin == ProblemOrigin::ErrorLog)
+        .unwrap()
+        .id
+        .clone()
+}
+
+#[test]
+fn error_report_validation_enforces_raw_byte_and_original_evidence_limits() {
+    let mut boundary = error_report();
+    boundary.summary = format!("{}ab", "错".repeat(2730));
+    boundary.report.as_mut().unwrap().evidence = serde_json::json!({"x": "a".repeat(4088)});
+    assert_eq!(boundary.summary.len(), 8192);
+    assert_eq!(
+        serde_json::to_vec(&boundary.report.as_ref().unwrap().evidence)
+            .unwrap()
+            .len(),
+        4096
+    );
+    assert!(boundary.validate().is_ok());
+    boundary.summary.push('x');
+    assert!(boundary.validate().is_err());
+    boundary.summary.pop();
+    boundary.report.as_mut().unwrap().evidence["x"] = "a".repeat(4089).into();
+    assert!(boundary.validate().is_err());
+
+    for case in 0..6 {
+        let mut invalid = error_report();
+        let report = invalid.report.as_mut().unwrap();
+        match case {
+            0 => report.sequence = 0,
+            1 => report.source_id.clear(),
+            2 => report.generation = "a".repeat(129),
+            3 => report.record_id = "record\0id".into(),
+            4 => report.evidence = serde_json::json!([]),
+            _ => invalid.report = None,
+        }
+        assert!(
+            invalid.validate().is_err(),
+            "reject malformed report case {case}"
+        );
+    }
+    let mut nested = error_report();
+    let mut value = serde_json::Value::Null;
+    for _ in 0..24 {
+        value = serde_json::json!({"child": value});
+    }
+    nested.report.as_mut().unwrap().evidence = value.clone();
+    assert!(nested.validate().is_ok());
+    nested.report.as_mut().unwrap().evidence = serde_json::json!({"child": value});
+    assert!(nested.validate().is_err());
+}
+
+#[test]
+fn received_error_report_preserves_raw_context_and_requires_approval_and_verification() {
+    let platform = Platform::new(true);
+    let id = register_report(&platform);
+    let task = run(RecoveryEngine::advance(&platform, &id)).unwrap();
+    assert_eq!(task.stage, RecoveryStage::AwaitingApproval);
+    assert_eq!(task.problem, error_report());
+    assert_eq!(
+        task.operation.as_ref().unwrap().action["request"]["problem"],
+        serde_json::to_value(error_report()).unwrap()
+    );
+    assert_eq!(platform.memory.lock().unwrap().calls, ["inspect"]);
+    let approval = platform.approval(&id).unwrap().unwrap();
+    platform
+        .commit(SessionCommand::HumanDecision {
+            task_id: id.clone(),
+            revision: approval.revision,
+            decision: ApprovalDecision::Approve,
+            actor: "operator".into(),
+            reason: "received report requires independently verified repair".into(),
+        })
+        .unwrap();
+    let task = run(RecoveryEngine::advance(&platform, &id)).unwrap();
+    assert_eq!(task.stage, RecoveryStage::Completed);
+    let memory = platform.memory.lock().unwrap();
+    assert_eq!(
+        memory
+            .calls
+            .iter()
+            .filter(|call| **call == "execute")
+            .count(),
+        1
+    );
+    assert_eq!(
+        memory
+            .calls
+            .iter()
+            .filter(|call| **call == "verify")
+            .count(),
+        1
+    );
+    let restored =
+        RecoverySession::restore(memory.session.config().clone(), &memory.entries).unwrap();
+    assert_eq!(restored.task(&id).unwrap().problem, error_report());
+}
+
+#[test]
+fn receipt_acknowledgement_can_advance_evidence_revision_before_initial_registration() {
+    let report = error_report();
+    for (revision, active, received, valid) in [
+        (report.incident_revision, false, true, true),
+        (report.incident_revision + 1, false, true, true),
+        (report.incident_revision - 1, false, true, false),
+        (report.incident_revision + 1, true, false, false),
+        (report.incident_revision + 1, true, true, false),
+    ] {
+        let platform = Platform::new(true);
+        let evidence = IncidentEvidence {
+            revision,
+            active,
+            received,
+            ..intake_evidence(&report)
+        };
+        let result = platform.commit(SessionCommand::Register {
+            problem: report.clone(),
+            incident: evidence,
+        });
+        assert_eq!(
+            result.is_ok(),
+            valid,
+            "revision {revision}, active {active}, received {received}"
+        );
+        let memory = platform.memory.lock().unwrap();
+        if valid {
+            assert_eq!(memory.session.tasks().next().unwrap().problem, report);
+        } else {
+            assert_eq!(memory.session.tasks().count(), 0);
+        }
+    }
+    let platform = Platform::new(true);
+    let active = problem("current-incident");
+    let mut evidence = intake_evidence(&active);
+    evidence.revision += 1;
+    assert!(
+        platform
+            .commit(SessionCommand::Register {
+                problem: active,
+                incident: evidence
+            })
+            .is_err()
+    );
+    let platform = Platform::new(true);
+    let mut evidence = intake_evidence(&report);
+    evidence.revision += 1;
+    evidence.incident_id = "another-receipt".into();
+    assert!(
+        platform
+            .commit(SessionCommand::Register {
+                problem: report,
+                incident: evidence
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn received_and_active_evidence_cannot_be_substituted_at_intake_authorization_or_send() {
+    for report in [problem("incident"), error_report()] {
+        for (active, received) in [
+            (true, true),
+            (false, false),
+            (
+                report.origin == ProblemOrigin::ErrorLog,
+                report.origin == ProblemOrigin::Incident,
+            ),
+        ] {
+            let platform = Platform::new(true);
+            let mut proof = intake_evidence(&report);
+            proof.active = active;
+            proof.received = received;
+            assert!(
+                platform
+                    .commit(SessionCommand::Register {
+                        problem: report.clone(),
+                        incident: proof,
+                    })
+                    .is_err()
+            );
+            assert_eq!(platform.memory.lock().unwrap().session.tasks().count(), 0);
+        }
+    }
+    let platform = Platform::new(true);
+    let id = register_report(&platform);
+    run(RecoveryEngine::advance(&platform, &id)).unwrap();
+    let approval = platform.approval(&id).unwrap().unwrap();
+    platform
+        .commit(SessionCommand::HumanDecision {
+            task_id: id.clone(),
+            revision: approval.revision,
+            decision: ApprovalDecision::Approve,
+            actor: "operator".into(),
+            reason: "scoped".into(),
+        })
+        .unwrap();
+    let task = platform.task(&id).unwrap();
+    let valid = intake_evidence(&task.problem);
+    let mut wrong = valid.clone();
+    wrong.active = true;
+    wrong.received = false;
+    let authorize = |incident| SessionCommand::Authorize {
+        task_id: id.clone(),
+        revision: task.revision,
+        observation: observation(),
+        incident,
+        authority: TargetAuthority {
+            target_id: task.problem.target_id.clone(),
+            epoch: "owner".into(),
+        },
+    };
+    assert!(platform.commit(authorize(wrong.clone())).is_err());
+    assert_eq!(
+        platform.approval(&id).unwrap().unwrap().state,
+        ApprovalState::Approved
+    );
+    platform.commit(authorize(valid.clone())).unwrap();
+    let memory = platform.memory.lock().unwrap();
+    assert!(
+        memory
+            .session
+            .validate_dispatch(&id, &valid, platform.now)
+            .is_ok()
+    );
+    assert!(
+        memory
+            .session
+            .validate_dispatch(&id, &wrong, platform.now)
+            .is_err()
+    );
+}
+
+#[test]
+fn received_error_identity_binds_body_and_source_without_replacing_unknown_work() {
+    let mut platform = Platform::new(false);
+    platform.unknown = true;
+    let id = register_report(&platform);
+    let original = error_report();
+    platform
+        .commit(SessionCommand::Register {
+            problem: original.clone(),
+            incident: intake_evidence(&original),
+        })
+        .unwrap();
+    assert_eq!(platform.memory.lock().unwrap().session.tasks().count(), 1);
+    for mutate in [0, 1, 2, 3] {
+        let mut changed = original.clone();
+        match mutate {
+            0 => changed.summary.push_str(" changed"),
+            1 => changed.evidence_refs = vec!["another-source:record-1".into()],
+            2 => changed.report.as_mut().unwrap().evidence["exit_code"] = 18.into(),
+            _ => {
+                changed.origin = ProblemOrigin::Incident;
+                changed.report = None;
+            }
+        }
+        assert!(
+            platform
+                .commit(SessionCommand::Register {
+                    incident: intake_evidence(&changed),
+                    problem: changed,
+                })
+                .is_err()
+        );
+    }
+    assert_eq!(
+        run(RecoveryEngine::advance(&platform, &id)).unwrap().stage,
+        RecoveryStage::Unknown
+    );
+    run(RecoveryEngine::advance(&platform, &id)).unwrap();
+    let mut next = original;
+    next.incident_id = "next-error".into();
+    assert!(matches!(
+        platform.commit(SessionCommand::Register {
+            incident: intake_evidence(&next),
+            problem: next,
+        }),
+        Err(EngineError::Recovery(RecoveryError::Busy))
+    ));
+    let memory = platform.memory.lock().unwrap();
+    assert_eq!(
+        memory
+            .calls
+            .iter()
+            .filter(|call| **call == "execute")
+            .count(),
+        1
+    );
+    assert!(!memory.session.releasable());
+}
+
+#[test]
+fn incident_defaults_do_not_change_existing_serialized_intake_bindings() {
+    let value = serde_json::to_value(problem("incident")).unwrap();
+    assert!(value.get("origin").is_none());
+    assert_eq!(
+        serde_json::from_value::<ProblemContext>(value)
+            .unwrap()
+            .origin,
+        ProblemOrigin::Incident
+    );
+    let proof = serde_json::to_value(incident()).unwrap();
+    assert!(proof.get("received").is_none());
+    assert!(
+        !serde_json::from_value::<IncidentEvidence>(proof)
+            .unwrap()
+            .received
+    );
 }
 #[test]
 fn engine_owns_review_execution_verification_and_summary_sequence() {

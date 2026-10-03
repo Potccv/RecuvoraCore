@@ -12,14 +12,28 @@ pub struct TargetAuthority {
     pub epoch: String,
 }
 
-/// Current trusted incident fact. The caller must check its revision atomically with
-/// execution authorization, or hold its incident gate through that commit.
+/// Trusted intake evidence. An Incident requires current active facts; an ErrorLog
+/// requires a protected immutable receipt. Receipt alone does not assert health.
+/// The caller must retain the matching identity/revision gate through dispatch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IncidentEvidence {
     pub incident_id: String,
     pub revision: u64,
     pub active: bool,
+    #[serde(default, skip_serializing_if = "not_received")]
+    pub received: bool,
+}
+fn not_received(value: &bool) -> bool {
+    !value
+}
+impl IncidentEvidence {
+    pub(crate) fn supports(&self, origin: ProblemOrigin) -> bool {
+        match origin {
+            ProblemOrigin::Incident => self.active && !self.received,
+            ProblemOrigin::ErrorLog => self.received && !self.active,
+        }
+    }
 }
 
 /// Committed history data. Loading it never dispatches an external operation.
@@ -817,16 +831,23 @@ impl RecoveryState {
                 {
                     if old.problem.target_id != problem.target_id
                         || old.problem.fingerprint != problem.fingerprint
+                        || old.problem.origin != problem.origin
+                        || (problem.origin == ProblemOrigin::ErrorLog && old.problem != *problem)
                     {
                         return Err(invalid("incident identity changed"));
                     }
                     return Ok(effects);
                 }
                 if incident.incident_id != problem.incident_id
-                    || incident.revision != problem.incident_revision
-                    || !incident.active
+                    || match problem.origin {
+                        ProblemOrigin::Incident => incident.revision != problem.incident_revision,
+                        ProblemOrigin::ErrorLog => incident.revision < problem.incident_revision,
+                    }
+                    || !incident.supports(problem.origin)
                 {
-                    return Err(invalid("current active incident required"));
+                    return Err(invalid(
+                        "matching incident or error report evidence required",
+                    ));
                 }
                 if self.tasks.values().any(|task| !task.stage.terminal()) {
                     return Err(RecoveryError::Busy);
@@ -934,7 +955,7 @@ impl RecoveryState {
                     || !crate::identity::valid_id(&authority.epoch)
                     || incident.incident_id != task.problem.incident_id
                     || incident.revision < task.problem.incident_revision
-                    || !incident.active
+                    || !incident.supports(task.problem.origin)
                 {
                     return Err(invalid("current incident and target ownership required"));
                 }
